@@ -109,6 +109,38 @@ checks must pass before merge.
 
 ## Future work
 
+- **Spec-first split / separate test writer.** Add a `specifying` stage
+  between `ready` and `implementing` so an independent spec agent writes
+  failing tests before production work starts:
+  `ready → specifying → implementing → validating → …`. The spec agent
+  is allowed to edit only test paths, and the orchestrator must verify
+  the new tests fail against `origin/<base>` before letting an
+  implementer run. The implementer prompt should carry the generated
+  test-file allowlist plus an explicit rule forbidding edits under
+  `tests/**`; after the implementer exits, the orchestrator rejects and
+  parks if `git diff --name-only HEAD origin/<base>` shows touched test
+  files. Spec-agent inability to produce tests should park with a typed
+  reason such as `ac-clarification`, `dep-missing`, or
+  `design-question`, giving humans a clearer next action than a freeform
+  park comment. Some issues cannot use this path, so extend the
+  decomposer manifest with a backward-compatible `spec_skip: true`
+  opt-out for docs, refactors, and other work that cannot be expressed
+  as failing tests.
+- **Repo memory carried across issues.** Add a small per-target-repo
+  memory file at `<target_root>/.agent-orchestrator/repo-memory.json` so
+  each issue does not start cold. Treat the file as orchestrator-owned
+  context, not PR content; implementation should prevent it from leaking
+  into agent commits or policy checks. Initial schema: `schema_version`,
+  `verify_commands`, `touched_files_top`, and capped `common_failures`
+  entries with summaries and timestamps. Update it from
+  `_handle_in_review` merge terminals on a best-effort basis, never
+  blocking a successful merge if the memory write fails. Read it into
+  decomposer and implementer prompts with strict caps such as top 10
+  touched files and top 5 failures, so agents get useful repository
+  context without turning the prompt into a stale knowledge base. Keep
+  the first version fixed-schema and file-backed; richer search,
+  exemplars, or lesson mining can wait until the simple signal proves
+  useful.
 - **Dockerfile / systemd / GitHub App migration.** The current deployment
   is a `run.sh` wrapper around `python -m orchestrator.main` on a single
   host. The design doc flags container / VM isolation as an open
@@ -116,10 +148,6 @@ checks must pass before merge.
   Restart=always` replace the `run.sh` self-restart wrapper, and the
   GitHub App migration lets the orchestrator drop the per-repo PAT in
   favor of an installation token.
-- **Parallel implementers and pick-best / merge.** `docs/workflow.md`
-  flags this as Week-2 / future: spawn several agents on the same issue,
-  pick the best of N solutions, or merge them together. Out of scope
-  for the first version (one solution per issue).
 - **Architectural review at `validating`.** `docs/workflow.md` flags
   this as optional: a reviewer pass that flags structural issues (e.g.
   oversized files that should be split). Not yet implemented.
