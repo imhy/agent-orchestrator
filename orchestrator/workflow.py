@@ -307,7 +307,10 @@ def _ensure_worktree(spec: RepoSpec, issue_number: int) -> Path:
             return wt
         _git("worktree", "remove", "--force", str(wt), cwd=spec.target_root)
 
-    _git("fetch", "--quiet", "origin", spec.base_branch, cwd=spec.target_root)
+    _git(
+        "fetch", "--quiet", spec.remote_name, spec.base_branch,
+        cwd=spec.target_root,
+    )
 
     have_branch = _git(
         "rev-parse", "--verify", branch, cwd=spec.target_root
@@ -317,7 +320,7 @@ def _ensure_worktree(spec: RepoSpec, issue_number: int) -> Path:
     else:
         result = _git(
             "worktree", "add", "-b", branch, str(wt),
-            f"origin/{spec.base_branch}",
+            f"{spec.remote_name}/{spec.base_branch}",
             cwd=spec.target_root,
         )
     if result.returncode != 0:
@@ -361,7 +364,10 @@ def _ensure_pr_worktree(spec: RepoSpec, issue_number: int) -> Path:
 
     # Fetch both base and the PR's remote branch so either path
     # below has a fresh ref to anchor on.
-    _git("fetch", "--quiet", "origin", spec.base_branch, cwd=spec.target_root)
+    _git(
+        "fetch", "--quiet", spec.remote_name, spec.base_branch,
+        cwd=spec.target_root,
+    )
     # The PR branch fetch is best-effort: a freshly created PR may not
     # have a remote ref yet (the orchestrator's own push opened it),
     # but in that case the local branch must already exist (we just
@@ -369,16 +375,17 @@ def _ensure_pr_worktree(spec: RepoSpec, issue_number: int) -> Path:
     # ref check below decide.
     #
     # Use an explicit refspec so single-branch / narrowed clones still
-    # create the `refs/remotes/origin/<branch>` ref. A bare `git fetch
-    # origin <branch>` on a single-branch clone only updates FETCH_HEAD
-    # and leaves no `origin/<branch>` for the `worktree add ... origin/<branch>`
-    # fallback to anchor on. The `+` prefix forces non-fast-forward
-    # update, which we want because the orchestrator pushes with
-    # `--force-with-lease` and the local remote-tracking ref may be
-    # stale relative to the just-rewritten remote tip.
+    # create the `refs/remotes/<remote>/<branch>` ref. A bare `git fetch
+    # <remote> <branch>` on a single-branch clone only updates FETCH_HEAD
+    # and leaves no `<remote>/<branch>` for the
+    # `worktree add ... <remote>/<branch>` fallback to anchor on. The `+`
+    # prefix forces non-fast-forward update, which we want because the
+    # orchestrator pushes with `--force-with-lease` and the local
+    # remote-tracking ref may be stale relative to the just-rewritten
+    # remote tip.
     _git(
-        "fetch", "--quiet", "origin",
-        f"+refs/heads/{branch}:refs/remotes/origin/{branch}",
+        "fetch", "--quiet", spec.remote_name,
+        f"+refs/heads/{branch}:refs/remotes/{spec.remote_name}/{branch}",
         cwd=spec.target_root,
     )
 
@@ -391,11 +398,11 @@ def _ensure_pr_worktree(spec: RepoSpec, issue_number: int) -> Path:
         )
     else:
         # Restore the local branch from the PR's remote head, NOT from
-        # `origin/<base>` -- the dev's commits live on `origin/<branch>`
+        # `<remote>/<base>` -- the dev's commits live on `<remote>/<branch>`
         # and rebuilding from base would discard them.
         result = _git(
             "worktree", "add", "-b", branch, str(wt),
-            f"origin/{branch}",
+            f"{spec.remote_name}/{branch}",
             cwd=spec.target_root,
         )
     if result.returncode != 0:
@@ -405,7 +412,8 @@ def _ensure_pr_worktree(spec: RepoSpec, issue_number: int) -> Path:
 
 def _has_new_commits(spec: RepoSpec, worktree: Path) -> bool:
     r = _git(
-        "rev-list", "--count", f"origin/{spec.base_branch}..HEAD",
+        "rev-list", "--count",
+        f"{spec.remote_name}/{spec.base_branch}..HEAD",
         cwd=worktree,
     )
     if r.returncode != 0:
@@ -417,14 +425,14 @@ def _branch_ahead_behind(
     spec: RepoSpec, worktree: Path, branch: str
 ) -> Tuple[int, int]:
     """Return `(ahead, behind)` commit counts for HEAD relative to
-    `origin/<branch>` in `worktree`.
+    `<remote>/<branch>` in `worktree`.
 
-    `ahead` = commits in HEAD not in `origin/<branch>` (unpushed local
-    work). `behind` = commits in `origin/<branch>` not in HEAD (the
+    `ahead` = commits in HEAD not in `<remote>/<branch>` (unpushed local
+    work). `behind` = commits in `<remote>/<branch>` not in HEAD (the
     local branch is stale relative to the remote PR head). `(0, 0)`
     means HEAD and the remote-tracking ref are identical.
 
-    The caller must have fetched `origin/<branch>` immediately before
+    The caller must have fetched `<remote>/<branch>` immediately before
     calling so the comparison is against the current remote tip.
     Returns `(0, 0)` on git error so a transient failure does not
     silently re-route the workflow; the caller's subsequent steps
@@ -432,7 +440,7 @@ def _branch_ahead_behind(
     """
     r = _git_hardened(
         "rev-list", "--left-right", "--count",
-        f"refs/remotes/origin/{branch}...HEAD",
+        f"refs/remotes/{spec.remote_name}/{branch}...HEAD",
         cwd=worktree,
     )
     if r.returncode != 0:
@@ -459,7 +467,7 @@ def _first_commit_subject(spec: RepoSpec, worktree: Path) -> str:
     """
     r = _git(
         "log", "--reverse", "--format=%s",
-        f"origin/{spec.base_branch}..HEAD",
+        f"{spec.remote_name}/{spec.base_branch}..HEAD",
         cwd=worktree,
     )
     if r.returncode != 0:
@@ -563,10 +571,13 @@ def _ensure_decompose_worktree(spec: RepoSpec, issue_number: int) -> Path:
     wt = _decompose_worktree_path(spec, issue_number)
     if wt.exists():
         _git("worktree", "remove", "--force", str(wt), cwd=spec.target_root)
-    _git("fetch", "--quiet", "origin", spec.base_branch, cwd=spec.target_root)
+    _git(
+        "fetch", "--quiet", spec.remote_name, spec.base_branch,
+        cwd=spec.target_root,
+    )
     result = _git(
         "worktree", "add", "--detach", str(wt),
-        f"origin/{spec.base_branch}",
+        f"{spec.remote_name}/{spec.base_branch}",
         cwd=spec.target_root,
     )
     if result.returncode != 0:
@@ -807,7 +818,7 @@ def _squash_and_force_push(
     authored under the AGENT_GIT_* identity (via env vars) so attribution
     matches the per-step commits this squash replaces.
     """
-    base_ref = f"origin/{spec.base_branch}"
+    base_ref = f"{spec.remote_name}/{spec.base_branch}"
     mb = _git("merge-base", base_ref, "HEAD", cwd=worktree)
     if mb.returncode != 0:
         return False, None, 0, f"merge-base failed: {(mb.stderr or '').strip()}"
@@ -966,15 +977,16 @@ def _build_implement_prompt(issue: Issue, comments_text: str) -> str:
 def _build_review_prompt(spec: RepoSpec, issue: Issue, comments_text: str) -> str:
     body = issue.body or "(no body)"
     convo = comments_text or "(no prior comments)"
+    base_ref = f"{spec.remote_name}/{spec.base_branch}"
     return (
         f"You are an automated code reviewer for GitHub issue #{issue.number}: {issue.title!r}. "
         "A separate codex session has implemented this issue and committed to the current "
-        f"branch. The base branch is `origin/{spec.base_branch}`.\n\n"
+        f"branch. The base branch is `{base_ref}`.\n\n"
         f"Issue body:\n{body}\n\n"
         f"Conversation so far:\n{convo}\n\n"
         "Inspect the change with:\n"
-        f"  git log --oneline origin/{spec.base_branch}..HEAD\n"
-        f"  git diff origin/{spec.base_branch}...HEAD\n\n"
+        f"  git log --oneline {base_ref}..HEAD\n"
+        f"  git diff {base_ref}...HEAD\n\n"
         "Review the change against the issue requirements. Flag correctness bugs, missing "
         "tests, scope creep, obvious style issues, and anything that would block a human "
         "approver. Do NOT edit or commit anything -- you are a reviewer only.\n\n"
@@ -1089,13 +1101,14 @@ def _refresh_base_and_worktrees(gh: GitHubClient, spec: RepoSpec) -> None:
     than perfect base sync.
     """
     fetch_r = _git(
-        "fetch", "--quiet", "origin", spec.base_branch,
+        "fetch", "--quiet", spec.remote_name, spec.base_branch,
         cwd=spec.target_root,
     )
     if fetch_r.returncode != 0:
         log.warning(
-            "repo=%s base fetch of origin/%s failed: %s",
-            spec.slug, spec.base_branch, (fetch_r.stderr or "").strip(),
+            "repo=%s base fetch of %s/%s failed: %s",
+            spec.slug, spec.remote_name, spec.base_branch,
+            (fetch_r.stderr or "").strip(),
         )
         return
 
@@ -1161,7 +1174,7 @@ def _sync_worktree_with_base(
         )
         return
 
-    base_ref = f"origin/{spec.base_branch}"
+    base_ref = f"{spec.remote_name}/{spec.base_branch}"
     behind_r = _git(
         "rev-list", "--count", f"HEAD..{base_ref}", cwd=worktree,
     )
@@ -1279,16 +1292,16 @@ def _route_pr_worktree_to_resolving_conflict(
     label = gh.workflow_label(issue)
     if label not in _PR_REFRESH_DETOUR_LABELS:
         log.debug(
-            "issue=#%d behind origin/%s by %d but label=%r; not detouring",
-            issue.number, spec.base_branch, behind, label,
+            "issue=#%d behind %s/%s by %d but label=%r; not detouring",
+            issue.number, spec.remote_name, spec.base_branch, behind, label,
         )
         return
 
     if state.get("awaiting_human"):
         log.debug(
-            "issue=#%d behind origin/%s by %d but awaiting_human=True; "
+            "issue=#%d behind %s/%s by %d but awaiting_human=True; "
             "leaving park intact rather than relabeling without progress",
-            issue.number, spec.base_branch, behind,
+            issue.number, spec.remote_name, spec.base_branch, behind,
         )
         return
 
@@ -1313,9 +1326,9 @@ def _route_pr_worktree_to_resolving_conflict(
         return
 
     log.info(
-        "issue=#%d behind origin/%s by %d commit(s); routing %r -> "
+        "issue=#%d behind %s/%s by %d commit(s); routing %r -> "
         "resolving_conflict so the handler can merge, push, and re-review",
-        issue.number, spec.base_branch, behind, label,
+        issue.number, spec.remote_name, spec.base_branch, behind, label,
     )
 
     # Match `_handle_in_review`'s seeding: only initialize `conflict_round`
@@ -1327,7 +1340,8 @@ def _route_pr_worktree_to_resolving_conflict(
     try:
         _post_pr_comment(
             gh, pr_number, state,
-            f":mag: PR is {behind} commit(s) behind `origin/{spec.base_branch}`; "
+            f":mag: PR is {behind} commit(s) behind "
+            f"`{spec.remote_name}/{spec.base_branch}`; "
             "orchestrator is attempting auto-resolution by merging it into "
             "the branch (label: `resolving_conflict`).",
         )
@@ -3829,7 +3843,8 @@ def _handle_in_review(gh: GitHubClient, spec: RepoSpec, issue: Issue) -> None:
             _post_pr_comment(
                 gh, int(pr_number), state,
                 f":mag: PR is not mergeable; orchestrator is attempting "
-                f"auto-resolution by merging `origin/{spec.base_branch}` "
+                f"auto-resolution by merging "
+                f"`{spec.remote_name}/{spec.base_branch}` "
                 "into the branch (label: `resolving_conflict`).",
             )
         except Exception:
@@ -3945,7 +3960,8 @@ def _merge_base_into_worktree(
     code under the orchestrator's UID at diff time.
     """
     r = _git_hardened(
-        "merge", "--no-edit", f"origin/{spec.base_branch}", cwd=worktree,
+        "merge", "--no-edit",
+        f"{spec.remote_name}/{spec.base_branch}", cwd=worktree,
     )
     if r.returncode == 0:
         return True, []
@@ -4049,14 +4065,14 @@ def _authed_fetch(
 
 
 def _build_conflict_resolution_prompt(
-    base_branch: str, files: list[str]
+    base_ref: str, files: list[str]
 ) -> str:
     shown = files[:20]
     files_md = "\n".join(f"- `{p}`" for p in shown)
     if len(files) > len(shown):
         files_md += f"\n- ... ({len(files) - len(shown)} more)"
     return (
-        f"`git merge origin/{base_branch}` left {len(files)} conflicted "
+        f"`git merge {base_ref}` left {len(files)} conflicted "
         "file(s) in your worktree. Resolve each conflict and COMMIT the "
         "merge in your current worktree. Do NOT push -- the orchestrator "
         "pushes and re-runs the reviewer.\n\n"
@@ -4199,15 +4215,15 @@ def _handle_resolving_conflict(
         # PR's commits.
         wt = _ensure_pr_worktree(spec, issue.number)
 
-    # Refresh `origin/<branch>` (the PR branch's remote tip) via the
+    # Refresh `<remote>/<branch>` (the PR branch's remote tip) via the
     # same hardened authenticated path `_push_branch` uses. We need a
     # current ref before the ahead/behind check below: a stale local
-    # `origin/<branch>` would mis-classify a real "remote moved out from
+    # `<remote>/<branch>` would mis-classify a real "remote moved out from
     # under us" situation as in-sync.
     branch = _branch_name(issue.number)
     fetch_branch = _authed_fetch(
         spec,
-        f"+refs/heads/{branch}:refs/remotes/origin/{branch}",
+        f"+refs/heads/{branch}:refs/remotes/{spec.remote_name}/{branch}",
         cwd=wt,
     )
     if fetch_branch.returncode != 0:
@@ -4217,8 +4233,8 @@ def _handle_resolving_conflict(
         )
         _park_awaiting_human(
             gh, issue, state,
-            f"{config.HITL_MENTIONS} `git fetch origin {branch}` failed "
-            "during conflict resolution; see orchestrator logs.",
+            f"{config.HITL_MENTIONS} `git fetch {spec.remote_name} {branch}` "
+            "failed during conflict resolution; see orchestrator logs.",
         )
         gh.write_pinned_state(issue, state)
         return
@@ -4245,10 +4261,10 @@ def _handle_resolving_conflict(
         _park_awaiting_human(
             gh, issue, state,
             f"{config.HITL_MENTIONS} worktree on `{branch}` is {ahead} "
-            f"ahead and {behind} behind `origin/{branch}` (PR head "
-            f"`{pr.head.sha[:8]}`); refusing to merge a stale or diverged "
-            "branch -- force-pushing the local state would clobber the "
-            "real PR head. Manual intervention needed.",
+            f"ahead and {behind} behind `{spec.remote_name}/{branch}` "
+            f"(PR head `{pr.head.sha[:8]}`); refusing to merge a stale "
+            "or diverged branch -- force-pushing the local state would "
+            "clobber the real PR head. Manual intervention needed.",
         )
         gh.write_pinned_state(issue, state)
         return
@@ -4273,8 +4289,8 @@ def _handle_resolving_conflict(
             return
         log.info(
             "issue=#%d resolving_conflict: pushing %d recovered commit(s) "
-            "ahead of origin/%s before attempting base merge",
-            issue.number, ahead, branch,
+            "ahead of %s/%s before attempting base merge",
+            issue.number, ahead, spec.remote_name, branch,
         )
         if not _push_branch(spec, wt, branch):
             _park_awaiting_human(
@@ -4291,11 +4307,12 @@ def _handle_resolving_conflict(
         gh.write_pinned_state(issue, state)
         return
 
-    # In sync. Refresh `origin/<base>` so the upcoming
-    # `git merge origin/<base>` sees the current base tip.
+    # In sync. Refresh `<remote>/<base>` so the upcoming
+    # `git merge <remote>/<base>` sees the current base tip.
     fetch_base = _authed_fetch(
         spec,
-        f"+refs/heads/{spec.base_branch}:refs/remotes/origin/{spec.base_branch}",
+        f"+refs/heads/{spec.base_branch}:"
+        f"refs/remotes/{spec.remote_name}/{spec.base_branch}",
         cwd=wt,
     )
     if fetch_base.returncode != 0:
@@ -4305,7 +4322,8 @@ def _handle_resolving_conflict(
         )
         _park_awaiting_human(
             gh, issue, state,
-            f"{config.HITL_MENTIONS} `git fetch origin {spec.base_branch}` "
+            f"{config.HITL_MENTIONS} "
+            f"`git fetch {spec.remote_name} {spec.base_branch}` "
             "failed during conflict resolution; see orchestrator logs.",
         )
         gh.write_pinned_state(issue, state)
@@ -4332,8 +4350,8 @@ def _handle_resolving_conflict(
                 gh, issue, state,
                 f"{config.HITL_MENTIONS} worktree has {len(dirty)} "
                 f"uncommitted change(s) after `git merge "
-                f"origin/{spec.base_branch}`; refusing to push or hand "
-                "back to validating with a dirty tree.",
+                f"{spec.remote_name}/{spec.base_branch}`; refusing to "
+                "push or hand back to validating with a dirty tree.",
             )
             gh.write_pinned_state(issue, state)
             return
@@ -4351,7 +4369,8 @@ def _handle_resolving_conflict(
             # situation to the operator within `MAX_CONFLICT_ROUNDS` ticks.
             log.info(
                 "issue=#%d resolving_conflict: branch already up-to-date "
-                "with origin/%s", issue.number, spec.base_branch,
+                "with %s/%s", issue.number,
+                spec.remote_name, spec.base_branch,
             )
             state.set("review_round", 0)
             state.set("conflict_round", conflict_round + 1)
@@ -4362,7 +4381,8 @@ def _handle_resolving_conflict(
             _park_awaiting_human(
                 gh, issue, state,
                 f"{config.HITL_MENTIONS} git push failed after auto-merging "
-                f"`origin/{spec.base_branch}`; see orchestrator logs.",
+                f"`{spec.remote_name}/{spec.base_branch}`; "
+                "see orchestrator logs.",
             )
             gh.write_pinned_state(issue, state)
             return
@@ -4376,7 +4396,8 @@ def _handle_resolving_conflict(
     if not conflicted_files:
         _park_awaiting_human(
             gh, issue, state,
-            f"{config.HITL_MENTIONS} `git merge origin/{spec.base_branch}` "
+            f"{config.HITL_MENTIONS} "
+            f"`git merge {spec.remote_name}/{spec.base_branch}` "
             "failed without listing conflicted files; manual intervention "
             "needed.",
         )
@@ -4384,7 +4405,7 @@ def _handle_resolving_conflict(
         return
 
     fix_prompt = _build_conflict_resolution_prompt(
-        spec.base_branch, conflicted_files
+        f"{spec.remote_name}/{spec.base_branch}", conflicted_files,
     )
     wt, result = _resume_dev_with_text(gh, spec, issue, state, fix_prompt)
     state.set("last_agent_action_at", _now_iso())

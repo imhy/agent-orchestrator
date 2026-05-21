@@ -1172,6 +1172,56 @@ class FirstCommitSubjectBaseBranchTest(unittest.TestCase):
         args, _cwd = captured[0]
         self.assertIn("origin/main..HEAD", args)
 
+    def test_uses_per_spec_remote_name(self) -> None:
+        # Multi-remote target clones (e.g. public `origin` + private fork
+        # `private`) need the rev range to reference the configured remote.
+        private_spec = config.RepoSpec(
+            slug="acme/widget",
+            target_root=Path("/tmp/orchestrator-test-target-root"),
+            base_branch="main",
+            remote_name="private",
+        )
+        fake_git, captured = self._capture_git("feat: hi\n")
+        with patch.object(workflow, "_git", fake_git):
+            workflow._first_commit_subject(
+                private_spec, Path("/tmp/wt-not-real")
+            )
+        args, _cwd = captured[0]
+        self.assertIn("private/main..HEAD", args)
+        self.assertNotIn("origin/main..HEAD", args)
+
+
+class HasNewCommitsRemoteNameTest(unittest.TestCase):
+    """`_has_new_commits` must compare against `spec.remote_name`, not the
+    hardcoded `origin`. With REPOS configured to drive a non-default remote
+    (e.g. `private`), the rev-list base reference has to honor that or the
+    handler will read stale commits from the wrong upstream."""
+
+    def test_rev_list_references_per_spec_remote(self) -> None:
+        from unittest.mock import MagicMock
+
+        captured: list[tuple] = []
+
+        def fake_git(*args, cwd):
+            captured.append((args, cwd))
+            r = MagicMock()
+            r.returncode = 0
+            r.stdout = "0\n"
+            r.stderr = ""
+            return r
+
+        private_spec = config.RepoSpec(
+            slug="acme/widget",
+            target_root=Path("/tmp/orchestrator-test-target-root"),
+            base_branch="main",
+            remote_name="private",
+        )
+        with patch.object(workflow, "_git", fake_git):
+            workflow._has_new_commits(private_spec, Path("/tmp/wt-not-real"))
+        args, _cwd = captured[0]
+        self.assertIn("private/main..HEAD", args)
+        self.assertNotIn("origin/main..HEAD", args)
+
 
 class HandleValidatingFreshReviewTest(unittest.TestCase, _PatchedWorkflowMixin):
     def _seeded(self, **state):

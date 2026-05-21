@@ -188,6 +188,13 @@ WORKTREES_DIR: Path = Path(
 # are opened against.
 BASE_BRANCH: str = os.environ.get("BASE_BRANCH", "main")
 
+# Name of the git remote in `TARGET_REPO_ROOT` that points at REPO on GitHub.
+# Defaults to `origin`; override when the local clone uses several remotes
+# (e.g. a public `origin` and a private fork named `private`) and the
+# orchestrator should drive the non-default one. Ignored when `REPOS` is set
+# -- the per-entry fourth field on each `REPOS` row takes precedence there.
+REMOTE_NAME: str = os.environ.get("REMOTE_NAME", "origin")
+
 
 @dataclass(frozen=True)
 class RepoSpec:
@@ -196,17 +203,26 @@ class RepoSpec:
     Replaces the global `REPO` / `TARGET_REPO_ROOT` / `BASE_BRANCH` reads
     inside workflow.py so a future multi-repo loop can drive several repos
     from one orchestrator process without touching module-level state.
+
+    `remote_name` is the name of the git remote in `target_root` that points
+    at this repo on GitHub. Defaults to `origin`; override when the local
+    clone uses several remotes (e.g. a public `origin` and a private fork
+    under a different remote name) and the orchestrator should drive the
+    non-default one.
     """
 
     slug: str
     target_root: Path
     base_branch: str
+    remote_name: str = "origin"
 
 
 def _parse_repos_env(raw: str) -> list[RepoSpec]:
     """Parse the REPOS env value into a list of RepoSpecs.
 
-    Format: one entry per line, ``owner/name|target_root|base_branch``.
+    Format: one entry per line, ``owner/name|target_root|base_branch`` with
+    an optional fourth ``|remote_name`` field (defaults to ``origin`` when
+    omitted, for backward compatibility with three-field configs).
     Blank lines and lines starting with ``#`` are skipped. ``;`` is also
     accepted as an entry separator so the value fits on a single line in a
     ``.env`` file (the simple parser in `_load_dotenv` cannot represent
@@ -225,12 +241,26 @@ def _parse_repos_env(raw: str) -> list[RepoSpec]:
         if not line or line.startswith("#"):
             continue
         parts = line.split("|")
-        if len(parts) != 3:
+        if len(parts) not in (3, 4):
             raise SystemExit(
                 f"orchestrator: REPOS entry #{entry_no} is malformed "
-                f"(expected 'owner/name|target_root|base_branch'): {line!r}"
+                f"(expected 'owner/name|target_root|base_branch' "
+                f"or 'owner/name|target_root|base_branch|remote_name'): "
+                f"{line!r}"
             )
-        slug, target_root, base_branch = (p.strip() for p in parts)
+        if len(parts) == 3:
+            slug, target_root, base_branch = (p.strip() for p in parts)
+            remote_name = "origin"
+        else:
+            slug, target_root, base_branch, remote_name = (
+                p.strip() for p in parts
+            )
+            if not remote_name:
+                raise SystemExit(
+                    f"orchestrator: REPOS entry #{entry_no} has empty "
+                    "remote_name (omit the trailing '|' to default to "
+                    "'origin')"
+                )
         # Require exactly two non-empty components separated by a single
         # '/'. A bare substring check would accept 'owner//repo' (empty
         # owner or repo) and 'owner/repo/extra' (extra path segment).
@@ -264,7 +294,10 @@ def _parse_repos_env(raw: str) -> list[RepoSpec]:
             )
         specs.append(
             RepoSpec(
-                slug=slug, target_root=target_path, base_branch=base_branch
+                slug=slug,
+                target_root=target_path,
+                base_branch=base_branch,
+                remote_name=remote_name,
             )
         )
     if not specs:
@@ -285,6 +318,7 @@ _REPO_SPECS: list[RepoSpec] = (
             slug=REPO,
             target_root=TARGET_REPO_ROOT,
             base_branch=BASE_BRANCH,
+            remote_name=REMOTE_NAME,
         )
     ]
 )

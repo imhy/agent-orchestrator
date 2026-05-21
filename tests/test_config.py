@@ -386,6 +386,21 @@ class MultiRepoConfigTest(unittest.TestCase):
         self.assertEqual(specs[0].slug, "owner/legacy")
         self.assertEqual(specs[0].target_root, Path("/tmp"))
         self.assertEqual(specs[0].base_branch, "trunk")
+        # No REMOTE_NAME set -> defaults to 'origin' so existing deployments
+        # keep working unchanged.
+        self.assertEqual(specs[0].remote_name, "origin")
+
+    def test_remote_name_env_override_for_single_repo(self) -> None:
+        # Multi-remote local clones (e.g. public `origin` + private fork
+        # `private`) need to drive the non-default remote.
+        config = self._load_config({
+            "REPO": "owner/legacy",
+            "TARGET_REPO_ROOT": "/tmp",
+            "BASE_BRANCH": "main",
+            "REMOTE_NAME": "private",
+        })
+        specs = config.default_repo_specs()
+        self.assertEqual(specs[0].remote_name, "private")
 
     def test_multi_entry_parsing_newline_and_semicolon(self) -> None:
         # Mix newlines, ';', blank lines, and a comment to verify the parser
@@ -408,9 +423,47 @@ class MultiRepoConfigTest(unittest.TestCase):
             self.assertEqual([s.base_branch for s in specs],
                              ["main", "develop", "master"])
             self.assertEqual(specs[1].target_root, other)
+            # Backward-compatible: three-field entries default remote_name
+            # to 'origin' so existing REPOS configs keep working.
+            for spec in specs:
+                self.assertEqual(spec.remote_name, "origin")
             # Returned list is a fresh copy so callers can't mutate the cache.
             specs.append("not-a-spec")  # type: ignore[arg-type]
             self.assertEqual(len(config.default_repo_specs()), 3)
+
+    def test_optional_fourth_field_sets_remote_name(self) -> None:
+        # Multi-remote target clones (e.g. public `origin` + private fork
+        # `private`) need to drive the non-default remote.
+        with tempfile.TemporaryDirectory() as td:
+            config = self._load_config({
+                "REPOS": (
+                    f"alpha/one|{td}|main|origin\n"
+                    f"beta/two|{td}|main|private"
+                ),
+            })
+            specs = config.default_repo_specs()
+            self.assertEqual(
+                [(s.slug, s.remote_name) for s in specs],
+                [("alpha/one", "origin"), ("beta/two", "private")],
+            )
+
+    def test_empty_remote_name_aborts_at_import(self) -> None:
+        # An explicit empty fourth field is a misconfiguration -- omit the
+        # trailing '|' to get the default. Surface the mistake at startup.
+        with tempfile.TemporaryDirectory() as td:
+            with self.assertRaises(SystemExit) as cm:
+                self._load_config({"REPOS": f"alpha/one|{td}|main|"})
+            self.assertIn("remote_name", str(cm.exception))
+
+    def test_too_many_pipe_segments_aborts_at_import(self) -> None:
+        # Five fields is malformed -- prevents a silent typo like
+        # `owner/repo|/path|main|origin|extra` from being misinterpreted.
+        with tempfile.TemporaryDirectory() as td:
+            with self.assertRaises(SystemExit) as cm:
+                self._load_config(
+                    {"REPOS": f"alpha/one|{td}|main|origin|extra"}
+                )
+            self.assertIn("malformed", str(cm.exception))
 
     def test_repos_overrides_legacy_trio(self) -> None:
         with tempfile.TemporaryDirectory() as td:
