@@ -66,6 +66,7 @@ from github.Issue import Issue
 from .. import config
 from ..agents import AgentResult
 from ..config import RepoSpec
+from ..state_machine import WorkflowLabel
 from ..github import GitHubClient, PinnedState
 
 
@@ -139,7 +140,7 @@ def _advance_after_docs_push(
     awaiting-human resume already consumed.
     """
     _ratchet_in_review_watermark_for_final_docs(gh, issue, state)
-    gh.set_workflow_label(issue, "in_review")
+    gh.set_workflow_label(issue, WorkflowLabel.IN_REVIEW)
 
 
 def _advance_after_docs_no_change(
@@ -152,7 +153,7 @@ def _advance_after_docs_no_change(
     awaiting-human resume already consumed, and advance to `in_review`.
     """
     _ratchet_in_review_watermark_for_final_docs(gh, issue, state)
-    gh.set_workflow_label(issue, "in_review")
+    gh.set_workflow_label(issue, WorkflowLabel.IN_REVIEW)
 
 
 def _handle_documenting(gh: GitHubClient, spec: RepoSpec, issue: Issue) -> None:
@@ -406,7 +407,7 @@ def _handle_documenting(gh: GitHubClient, spec: RepoSpec, issue: Issue) -> None:
         # Reconcile succeeded (or the worktree didn't exist): the
         # drift unwind is complete, clear the sentinel and relabel.
         state.set("docs_drift_unwind_pending", False)
-        gh.set_workflow_label(issue, "validating")
+        gh.set_workflow_label(issue, WorkflowLabel.VALIDATING)
         gh.write_pinned_state(issue, state)
         return
 

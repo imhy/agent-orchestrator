@@ -21,6 +21,7 @@ from orchestrator.github import (
     _write_event_record,
     build_event_record,
 )
+from orchestrator.state_machine import WorkflowLabel, coerce_workflow_label
 
 
 @dataclass
@@ -267,15 +268,18 @@ class FakeGitHubClient:
         return out
 
     @staticmethod
-    def workflow_label(issue: FakeIssue) -> Optional[str]:
+    def workflow_label(issue: FakeIssue) -> Optional[WorkflowLabel]:
         for lbl in issue.labels:
             if lbl.name in WORKFLOW_LABELS:
-                return lbl.name
+                return WorkflowLabel(lbl.name)
         return None
 
     def set_workflow_label(
         self, issue: FakeIssue, new_label: Optional[str]
     ) -> None:
+        # Mirror the real client's strict typo guard so the suite's
+        # fake-backed handler tests exercise the same invariant.
+        new_label = coerce_workflow_label(new_label) if new_label else None
         keep = [l for l in issue.labels if l.name not in WORKFLOW_LABELS]
         if new_label:
             keep.append(FakeLabel(new_label))
@@ -337,12 +341,15 @@ class FakeGitHubClient:
         parent_number: int,
         labels: list[str],
     ) -> FakeIssue:
+        # Mirror the real client's strict typo guard on this direct
+        # workflow-label write path.
+        validated = [coerce_workflow_label(l) for l in labels]
         full_body = f"{(body or '').rstrip()}\n\nParent: #{parent_number}"
         child = FakeIssue(
             number=next(self._next_issue_number),
             title=title,
             body=full_body,
-            labels=[FakeLabel(l) for l in labels],
+            labels=[FakeLabel(l) for l in validated],
         )
         self._issues[child.number] = child
         self.created_child_issues.append(child)

@@ -26,6 +26,7 @@ from github.Issue import Issue
 from .. import config
 from ..agents import AgentResult
 from ..config import RepoSpec
+from ..state_machine import WorkflowLabel
 from ..github import GitHubClient, PinnedState
 
 
@@ -254,7 +255,8 @@ def _handle_decomposing(gh: GitHubClient, spec: RepoSpec, issue: Issue) -> None:
             # plain blocked parent and re-enter implementation after all
             # children resolved -- the opposite of what the manifest asked.
             finalize_label = (
-                "umbrella" if state.get("umbrella") else "blocked"
+                WorkflowLabel.UMBRELLA if state.get("umbrella")
+                else WorkflowLabel.BLOCKED
             )
             gh.set_workflow_label(issue, finalize_label)
             gh.write_pinned_state(issue, state)
@@ -302,7 +304,7 @@ def _handle_decomposing(gh: GitHubClient, spec: RepoSpec, issue: Issue) -> None:
                 prior = state.get("last_action_comment_id")
                 if not isinstance(prior, int) or latest > prior:
                     state.set("last_action_comment_id", latest)
-            gh.set_workflow_label(issue, "implementing")
+            gh.set_workflow_label(issue, WorkflowLabel.IMPLEMENTING)
             gh.write_pinned_state(issue, state)
             _wf._handle_implementing(gh, spec, issue)
             return
@@ -443,7 +445,7 @@ def _handle_decomposing(gh: GitHubClient, spec: RepoSpec, issue: Issue) -> None:
                 f":mag: decomposer says this fits one context: {rationale}",
             )
             state.set("decomposed_at", _wf._now_iso())
-            gh.set_workflow_label(issue, "ready")
+            gh.set_workflow_label(issue, WorkflowLabel.READY)
             gh.write_pinned_state(issue, state)
             return
 
@@ -484,7 +486,7 @@ def _handle_decomposing(gh: GitHubClient, spec: RepoSpec, issue: Issue) -> None:
                     title=child["title"],
                     body=child["body"],
                     parent_number=issue.number,
-                    labels=["blocked"],
+                    labels=[WorkflowLabel.BLOCKED],
                 )
             except Exception:
                 _wf.log.exception(
@@ -564,13 +566,13 @@ def _handle_decomposing(gh: GitHubClient, spec: RepoSpec, issue: Issue) -> None:
                 f"implementation of its own; will auto-resolve once every "
                 f"child resolves):\n\n{summary}"
             )
-            final_label = "umbrella"
+            final_label = WorkflowLabel.UMBRELLA
         else:
             summary_intro = (
                 f":bookmark_tabs: decomposer split this into {len(created)} "
                 f"child issue(s):\n\n{summary}"
             )
-            final_label = "blocked"
+            final_label = WorkflowLabel.BLOCKED
         _wf._post_issue_comment(gh, issue, state, summary_intro)
         gh.set_workflow_label(issue, final_label)
         gh.write_pinned_state(issue, state)
@@ -584,7 +586,7 @@ def _handle_decomposing(gh: GitHubClient, spec: RepoSpec, issue: Issue) -> None:
                 continue
             try:
                 child_issue = gh.get_issue(child_number)
-                gh.set_workflow_label(child_issue, "ready")
+                gh.set_workflow_label(child_issue, WorkflowLabel.READY)
             except Exception:
                 _wf.log.exception(
                     "issue=#%s could not flip child #%d to ready; the parent's "
@@ -653,7 +655,7 @@ def _handle_ready(gh: GitHubClient, spec: RepoSpec, issue: Issue) -> None:
         prior = state.get("last_action_comment_id")
         if not isinstance(prior, int) or latest > prior:
             state.set("last_action_comment_id", latest)
-    gh.set_workflow_label(issue, "implementing")
+    gh.set_workflow_label(issue, WorkflowLabel.IMPLEMENTING)
     gh.write_pinned_state(issue, state)
     _wf._handle_implementing(gh, spec, issue)
 
@@ -811,7 +813,7 @@ def _handle_blocked(gh: GitHubClient, spec: RepoSpec, issue: Issue) -> None:
         # implementation.
         state.set("awaiting_human", False)
         state.set("park_reason", None)
-        gh.set_workflow_label(issue, "ready")
+        gh.set_workflow_label(issue, WorkflowLabel.READY)
         gh.write_pinned_state(issue, state)
         return
 
@@ -831,7 +833,7 @@ def _handle_blocked(gh: GitHubClient, spec: RepoSpec, issue: Issue) -> None:
             int(children[int(d)]) for d in deps if int(d) < len(children)
         ]
         if all(child_labels.get(dn) == "done" for dn in dep_numbers):
-            gh.set_workflow_label(child_issues[cn], "ready")
+            gh.set_workflow_label(child_issues[cn], WorkflowLabel.READY)
             relabeled = True
     if relabeled:
         gh.write_pinned_state(issue, state)
@@ -954,7 +956,7 @@ def _handle_umbrella(gh: GitHubClient, spec: RepoSpec, issue: Issue) -> None:
         state.set("awaiting_human", False)
         state.set("park_reason", None)
         state.set("umbrella_resolved_at", _wf._now_iso())
-        gh.set_workflow_label(issue, "done")
+        gh.set_workflow_label(issue, WorkflowLabel.DONE)
         gh.write_pinned_state(issue, state)
         try:
             issue.edit(state="closed")
@@ -980,7 +982,7 @@ def _handle_umbrella(gh: GitHubClient, spec: RepoSpec, issue: Issue) -> None:
             int(children[int(d)]) for d in deps if int(d) < len(children)
         ]
         if all(child_labels.get(dn) == "done" for dn in dep_numbers):
-            gh.set_workflow_label(child_issues[cn], "ready")
+            gh.set_workflow_label(child_issues[cn], WorkflowLabel.READY)
             relabeled = True
     if relabeled:
         gh.write_pinned_state(issue, state)

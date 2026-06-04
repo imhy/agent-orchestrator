@@ -34,6 +34,7 @@ from typing import Optional
 
 from github.Issue import Issue
 
+from .state_machine import WorkflowLabel
 from .github import PINNED_STATE_MARKER, GitHubClient, PinnedState
 from .workflow_messages import (
     _ORCH_COMMENT_MARKER,
@@ -244,4 +245,4 @@ def _route_drift_to_decomposing(
     state.set("umbrella", None)
     state.set("awaiting_human", False)
     state.set("park_reason", None)
-    gh.set_workflow_label(issue, "decomposing")
+    gh.set_workflow_label(issue, WorkflowLabel.DECOMPOSING)

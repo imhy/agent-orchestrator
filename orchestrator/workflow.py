@@ -47,6 +47,7 @@ from github.Issue import Issue
 from . import analytics, config
 from .agents import AgentResult, run_agent
 from .config import RepoSpec
+from .state_machine import WorkflowLabel
 from .github import (
     BACKLOG_LABEL,
     COMMUNITY_CONTRIBUTION_LABEL,
@@ -209,7 +210,7 @@ log = logging.getLogger(__name__)
 # Workflow labels whose handlers can read or write OTHER issues' pinned
 # state -- the cross-issue writers are:
 #   * `_handle_decomposing` -- creates child issues, seeds their pinned
-#     state, may flip their labels (`set_workflow_label(child, "ready")`),
+#     state, may flip their labels (`set_workflow_label(child, WorkflowLabel.READY)`),
 #     and the half-finished recovery branch seeds `parent_number` on each
 #     already-recorded child.
 #   * `_handle_blocked` -- the dep-graph walk flips no-longer-blocked
@@ -250,7 +251,7 @@ log = logging.getLogger(__name__)
 # per-issue state + worktree, so they stay eligible for
 # unconditional parallel fan-out.
 _FAMILY_AWARE_LABELS = frozenset({
-    "decomposing", "blocked", "umbrella",
+    WorkflowLabel.DECOMPOSING, WorkflowLabel.BLOCKED, WorkflowLabel.UMBRELLA,
 })
 
 
@@ -965,7 +966,7 @@ def _handle_pickup(gh: GitHubClient, spec: RepoSpec, issue: Issue) -> None:
             "user_content_hash",
             _compute_user_content_hash(issue, _orchestrator_ids(state)),
         )
-        gh.set_workflow_label(issue, "decomposing")
+        gh.set_workflow_label(issue, WorkflowLabel.DECOMPOSING)
         gh.write_pinned_state(issue, state)
         _handle_decomposing(gh, spec, issue)
         return
@@ -991,7 +992,7 @@ def _handle_pickup(gh: GitHubClient, spec: RepoSpec, issue: Issue) -> None:
         "user_content_hash",
         _compute_user_content_hash(issue, _orchestrator_ids(state)),
     )
-    gh.set_workflow_label(issue, "implementing")
+    gh.set_workflow_label(issue, WorkflowLabel.IMPLEMENTING)
     gh.write_pinned_state(issue, state)
     _handle_implementing(gh, spec, issue)
 
@@ -1066,7 +1067,7 @@ def _finalize_if_pr_merged(
         return False
     stage = gh.workflow_label(issue)
     state.set("merged_at", _now_iso())
-    gh.set_workflow_label(issue, "done")
+    gh.set_workflow_label(issue, WorkflowLabel.DONE)
     gh.write_pinned_state(issue, state)
     gh.emit_event(
         "pr_merged",
@@ -1146,7 +1147,7 @@ def _drain_review_pr_terminals(
         conflict_round_field = int(conflict_round_field or 0)
     if pr_status == "merged":
         state.set("merged_at", _now_iso())
-        gh.set_workflow_label(issue, "done")
+        gh.set_workflow_label(issue, WorkflowLabel.DONE)
         gh.write_pinned_state(issue, state)
         gh.emit_event(
             "pr_merged",
@@ -1169,7 +1170,7 @@ def _drain_review_pr_terminals(
         return True
     if pr_status == "closed":
         state.set("closed_without_merge_at", _now_iso())
-        gh.set_workflow_label(issue, "rejected")
+        gh.set_workflow_label(issue, WorkflowLabel.REJECTED)
         gh.write_pinned_state(issue, state)
         gh.emit_event(
             "pr_closed_without_merge",
@@ -1191,7 +1192,7 @@ def _drain_review_pr_terminals(
         return True
     if getattr(issue, "state", "open") == "closed":
         state.set("closed_without_merge_at", _now_iso())
-        gh.set_workflow_label(issue, "rejected")
+        gh.set_workflow_label(issue, WorkflowLabel.REJECTED)
         gh.write_pinned_state(issue, state)
         return True
     return False
@@ -1266,7 +1267,7 @@ def _finalize_if_issue_closed(
             return True
     stage = gh.workflow_label(issue)
     state.set("closed_without_merge_at", _now_iso())
-    gh.set_workflow_label(issue, "rejected")
+    gh.set_workflow_label(issue, WorkflowLabel.REJECTED)
     gh.write_pinned_state(issue, state)
     if pr is None:
         return True

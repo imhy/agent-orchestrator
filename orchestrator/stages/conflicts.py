@@ -29,6 +29,7 @@ from github.Issue import Issue
 from .. import config
 from ..agents import AgentResult
 from ..config import RepoSpec
+from ..state_machine import WorkflowLabel
 from ..github import (
     BASE_SYNC_HOLD_LABEL,
     GitHubClient,
@@ -187,7 +188,7 @@ def _handle_resolving_conflict(
             )
             # Pushed branch diff -> hand straight back to validating;
             # the single docs pass runs after final reviewer approval.
-            gh.set_workflow_label(issue, "validating")
+            gh.set_workflow_label(issue, WorkflowLabel.VALIDATING)
         gh.write_pinned_state(issue, state)
         return
 
@@ -347,7 +348,7 @@ def _handle_resolving_conflict(
         )
         # Pushed branch diff -> hand straight back to validating; the
         # single docs pass runs after final reviewer approval.
-        gh.set_workflow_label(issue, "validating")
+        gh.set_workflow_label(issue, WorkflowLabel.VALIDATING)
         gh.write_pinned_state(issue, state)
         return
 
@@ -447,7 +448,7 @@ def _handle_resolving_conflict(
             # so the reviewer / in_review tick can re-evaluate. Every
             # other resolving_conflict exit also targets validating now;
             # the single docs pass is deferred to the post-approval hop.
-            gh.set_workflow_label(issue, "validating")
+            gh.set_workflow_label(issue, WorkflowLabel.VALIDATING)
             gh.write_pinned_state(issue, state)
             return
         if not _wf._push_branch(
@@ -475,7 +476,7 @@ def _handle_resolving_conflict(
         )
         # Pushed branch diff -> hand straight back to validating; the
         # single docs pass runs after final reviewer approval.
-        gh.set_workflow_label(issue, "validating")
+        gh.set_workflow_label(issue, WorkflowLabel.VALIDATING)
         gh.write_pinned_state(issue, state)
         return
 
@@ -599,5 +600,5 @@ def _post_conflict_resolution_result(
     # Pushed branch diff (fresh conflict resolution OR awaiting-human
     # resume that landed a commit) -> hand straight back to validating;
     # the single docs pass runs after final reviewer approval.
-    gh.set_workflow_label(issue, "validating")
+    gh.set_workflow_label(issue, WorkflowLabel.VALIDATING)
     gh.write_pinned_state(issue, state)
