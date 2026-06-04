@@ -36,6 +36,7 @@ from github.Issue import Issue
 
 from .. import config
 from ..config import RepoSpec
+from ..state_machine import WorkflowLabel
 from ..github import (
     BASE_SYNC_HOLD_LABEL,
     GitHubClient,
@@ -390,7 +391,7 @@ def _handle_in_review(gh: GitHubClient, spec: RepoSpec, issue: Issue) -> None:
         # handler is not greeted with stale awaiting_human state.
         state.set("awaiting_human", False)
         state.set("park_reason", None)
-        gh.set_workflow_label(issue, "fixing")
+        gh.set_workflow_label(issue, WorkflowLabel.FIXING)
         gh.write_pinned_state(issue, state)
         return
 
@@ -497,7 +498,7 @@ def _handle_in_review(gh: GitHubClient, spec: RepoSpec, issue: Issue) -> None:
             # is deferred to the final-docs handoff after reviewer
             # approval).
             state.set("review_round", 0)
-            gh.set_workflow_label(issue, "validating")
+            gh.set_workflow_label(issue, WorkflowLabel.VALIDATING)
         gh.write_pinned_state(issue, state)
         return
 

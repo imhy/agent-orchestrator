@@ -22,6 +22,7 @@ from github.PullRequest import PullRequest
 from github.Repository import Repository
 
 from . import analytics, config
+from .state_machine import WorkflowLabel, coerce_workflow_label
 
 log = logging.getLogger(__name__)
 
@@ -34,22 +35,26 @@ PINNED_STATE_TEMPLATE = "<!--orchestrator-state {payload}-->"
 # documenting -> in_review) but is otherwise only the order in which
 # `ensure_workflow_labels` creates labels on a fresh repo; lifecycle
 # routing itself is driven by the stage handlers, not by this tuple.
-WORKFLOW_LABEL_SPECS: tuple[tuple[str, str, str], ...] = (
-    ("decomposing", "fbca04", "Orchestrator is breaking this issue into sub-issues"),
-    ("ready", "0e8a16", "Decomposed and ready for implementation"),
-    ("blocked", "b60205", "Blocked on another issue"),
-    ("umbrella", "ededed", "Parent of child issues with no implementation of its own"),
-    ("implementing", "1d76db", "A coding agent is working on this"),
-    ("validating", "8a2be2", "Automated review/tests are running"),
-    ("documenting", "c2e0c6", "Documentation pass after reviewer approval (final-docs hop), before in_review"),
-    ("in_review", "d93f0b", "PR is open, awaiting human review"),
-    ("fixing", "fef2c0", "Addressing PR feedback before the next reviewer round"),
-    ("resolving_conflict", "e99695", "Auto-resolving merge conflicts after a sibling PR landed first"),
-    ("question", "d876e3", "Awaiting a clarifying answer from a human before the orchestrator can advance"),
-    ("done", "cccccc", "Merged to main"),
-    ("rejected", "5c0000", "Issue rejected / closed without merge"),
+WORKFLOW_LABEL_SPECS: tuple[tuple[WorkflowLabel, str, str], ...] = (
+    (WorkflowLabel.DECOMPOSING, "fbca04", "Orchestrator is breaking this issue into sub-issues"),
+    (WorkflowLabel.READY, "0e8a16", "Decomposed and ready for implementation"),
+    (WorkflowLabel.BLOCKED, "b60205", "Blocked on another issue"),
+    (WorkflowLabel.UMBRELLA, "ededed", "Parent of child issues with no implementation of its own"),
+    (WorkflowLabel.IMPLEMENTING, "1d76db", "A coding agent is working on this"),
+    (WorkflowLabel.VALIDATING, "8a2be2", "Automated review/tests are running"),
+    (WorkflowLabel.DOCUMENTING, "c2e0c6", "Documentation pass after reviewer approval (final-docs hop), before in_review"),
+    (WorkflowLabel.IN_REVIEW, "d93f0b", "PR is open, awaiting human review"),
+    (WorkflowLabel.FIXING, "fef2c0", "Addressing PR feedback before the next reviewer round"),
+    (WorkflowLabel.RESOLVING_CONFLICT, "e99695", "Auto-resolving merge conflicts after a sibling PR landed first"),
+    (WorkflowLabel.QUESTION, "d876e3", "Awaiting a clarifying answer from a human before the orchestrator can advance"),
+    (WorkflowLabel.DONE, "cccccc", "Merged to main"),
+    (WorkflowLabel.REJECTED, "5c0000", "Issue rejected / closed without merge"),
 )
-WORKFLOW_LABELS = frozenset(name for name, _, _ in WORKFLOW_LABEL_SPECS)
+# Source of truth is the enum; assert the spec table stays exhaustive so a
+# new `WorkflowLabel` member cannot ship without a color/description (and a
+# bootstrap label) here.
+assert {spec[0] for spec in WORKFLOW_LABEL_SPECS} == set(WorkflowLabel)
+WORKFLOW_LABELS = frozenset(WorkflowLabel)
 
 BASE_SYNC_HOLD_LABEL = "hold_base_sync"
 BACKLOG_LABEL = "backlog"
@@ -273,8 +278,10 @@ class GitHubClient:
         # by issuing one query per label (the GitHub Issues API treats
         # `labels` as AND, not OR).
         for label_name in (
-            "implementing", "documenting", "validating",
-            "in_review", "fixing", "resolving_conflict", "question",
+            WorkflowLabel.IMPLEMENTING, WorkflowLabel.DOCUMENTING,
+            WorkflowLabel.VALIDATING, WorkflowLabel.IN_REVIEW,
+            WorkflowLabel.FIXING, WorkflowLabel.RESOLVING_CONFLICT,
+            WorkflowLabel.QUESTION,
         ):
             try:
                 label_obj = self.repo.get_label(label_name)
@@ -300,19 +307,24 @@ class GitHubClient:
                     yield issue
 
     @staticmethod
-    def workflow_label(issue: Issue) -> Optional[str]:
+    def workflow_label(issue: Issue) -> Optional[WorkflowLabel]:
         for lbl in issue.labels:
             if lbl.name in WORKFLOW_LABELS:
-                return lbl.name
+                return WorkflowLabel(lbl.name)
         return None
 
     def set_workflow_label(self, issue: Issue, new_label: Optional[str]) -> None:
+        # Typo guard (always strict): a label not in `WorkflowLabel` is
+        # always a bug -- raise rather than apply a literal label that the
+        # next tick would silently treat as unlabeled-pickup. Accepts a
+        # `WorkflowLabel` or its string value.
+        new = coerce_workflow_label(new_label) if new_label else None
         keep = [l.name for l in issue.labels if l.name not in WORKFLOW_LABELS]
-        if new_label:
-            keep.append(new_label)
+        if new is not None:
+            keep.append(new)
         issue.set_labels(*keep)
-        if new_label:
-            self._emit_stage_enter(issue, new_label)
+        if new is not None:
+            self._emit_stage_enter(issue, new)
 
     _RECORDED_EVENTS_CAP = 500
 
@@ -392,8 +404,13 @@ class GitHubClient:
         `Parent: #<n>` line keeps the parent open until every child
         resolves and `_handle_blocked` flips the parent to `ready`.
         """
+        # Typo guard for this direct workflow-label write path (bypasses
+        # `set_workflow_label`): every label here is an orchestrator-authored
+        # workflow label, so coerce each so a typo fails loudly instead of
+        # creating a child with an invisible label.
+        validated = [coerce_workflow_label(lbl) for lbl in labels]
         full_body = f"{(body or '').rstrip()}\n\nParent: #{parent_number}"
-        return self.repo.create_issue(title=title, body=full_body, labels=labels)
+        return self.repo.create_issue(title=title, body=full_body, labels=validated)
 
     def read_pinned_state(self, issue: Issue) -> PinnedState:
         for c in issue.get_comments():

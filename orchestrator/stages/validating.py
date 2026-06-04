@@ -32,6 +32,7 @@ from github.Issue import Issue
 from .. import config
 from ..agents import AgentResult
 from ..config import RepoSpec
+from ..state_machine import WorkflowLabel
 from ..github import GitHubClient, PinnedState
 
 
@@ -1028,7 +1029,7 @@ def _handle_validating(gh: GitHubClient, spec: RepoSpec, issue: Issue) -> None:
         # `in_review`. The PR watermarks, approval comment, and squash
         # comment seeded here are preserved across the documenting hop
         # unchanged.
-        gh.set_workflow_label(issue, "documenting")
+        gh.set_workflow_label(issue, WorkflowLabel.DOCUMENTING)
         gh.write_pinned_state(issue, state)
         return
 

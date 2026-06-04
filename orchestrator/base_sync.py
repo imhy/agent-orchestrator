@@ -50,7 +50,6 @@ from typing import Optional, Tuple
 from github.Issue import Issue
 
 from . import config
-from .config import RepoSpec
 from .branch_publication import _branch_ahead_behind
 from .git_plumbing import (
     _authed_fetch,
@@ -59,6 +58,7 @@ from .git_plumbing import (
     _git_hardened,
     _push_branch,
 )
+from .state_machine import WorkflowLabel
 from .github import (
     BACKLOG_LABEL,
     BASE_SYNC_HOLD_LABEL,
@@ -266,7 +266,10 @@ def _refresh_base_and_worktrees(
 # do the rebase anyway. Other labels mean either no PR yet (pre-PR
 # path applies instead) or terminal (done/rejected, nothing to refresh).
 _PR_REFRESH_DETOUR_LABELS = frozenset(
-    {"validating", "documenting", "in_review", "fixing"},
+    {
+        WorkflowLabel.VALIDATING, WorkflowLabel.DOCUMENTING,
+        WorkflowLabel.IN_REVIEW, WorkflowLabel.FIXING,
+    },
 )
 
 
@@ -1609,5 +1612,5 @@ def _route_pr_worktree_to_resolving_conflict(
         review_round=int(state.get("review_round") or 0),
         retry_count=state.get("retry_count"),
     )
-    gh.set_workflow_label(issue, "resolving_conflict")
+    gh.set_workflow_label(issue, WorkflowLabel.RESOLVING_CONFLICT)
     gh.write_pinned_state(issue, state)

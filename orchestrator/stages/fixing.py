@@ -85,6 +85,7 @@ from github.Issue import Issue
 
 from .. import config
 from ..config import RepoSpec
+from ..state_machine import WorkflowLabel
 from ..github import GitHubClient
 
 
@@ -307,7 +308,7 @@ def _handle_fixing(gh: GitHubClient, spec: RepoSpec, issue: Issue) -> None:
     # work.
     if not new_feedback:
         _clear_pending_fix_bookmarks(state)
-        gh.set_workflow_label(issue, "validating")
+        gh.set_workflow_label(issue, WorkflowLabel.VALIDATING)
         gh.write_pinned_state(issue, state)
         return
 
@@ -430,7 +431,7 @@ def _handle_fixing(gh: GitHubClient, spec: RepoSpec, issue: Issue) -> None:
     else:
         round_n = int(state.get("review_round") or 0)
         state.set("review_round", round_n + 1)
-    gh.set_workflow_label(issue, "validating")
+    gh.set_workflow_label(issue, WorkflowLabel.VALIDATING)
     gh.write_pinned_state(issue, state)
 
 

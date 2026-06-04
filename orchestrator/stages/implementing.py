@@ -28,6 +28,7 @@ from github.Issue import Issue
 from .. import config
 from ..agents import AgentResult
 from ..config import RepoSpec
+from ..state_machine import WorkflowLabel
 from ..github import GitHubClient, PinnedState
 
 
@@ -787,7 +788,7 @@ def _on_commits(
     state.set("silent_park_count", 0)
     # Hand off straight to `validating`. The docs pass runs only as the
     # final-docs handoff after the reviewer agent approves.
-    gh.set_workflow_label(issue, "validating")
+    gh.set_workflow_label(issue, WorkflowLabel.VALIDATING)
 
 
 def _on_question(

@@ -38,6 +38,7 @@ from github.Issue import Issue
 from .. import config
 from ..agents import AgentResult
 from ..config import RepoSpec
+from ..state_machine import WorkflowLabel
 from ..github import GitHubClient, PinnedState
 
 
@@ -202,7 +203,7 @@ def _handle_question(gh: GitHubClient, spec: RepoSpec, issue: Issue) -> None:
     # inspection window ends.
     if getattr(issue, "state", "open") == "closed":
         state.set("question_closed_at", _wf._now_iso())
-        gh.set_workflow_label(issue, "done")
+        gh.set_workflow_label(issue, WorkflowLabel.DONE)
         gh.write_pinned_state(issue, state)
         _wf._cleanup_question_worktree(spec, issue.number)
         return
