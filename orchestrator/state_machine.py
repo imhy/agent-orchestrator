@@ -23,7 +23,11 @@ chokepoint that calls them.
 """
 from __future__ import annotations
 
+import logging
 from enum import StrEnum
+from typing import Optional
+
+log = logging.getLogger(__name__)
 
 
 class WorkflowLabel(StrEnum):
@@ -75,3 +79,139 @@ def coerce_workflow_label(value: str) -> WorkflowLabel:
         raise ValueError(
             f"{value!r} is not a valid workflow label; expected one of: {valid}"
         ) from None
+
+
+class IllegalTransition(Exception):
+    """A workflow-label write would make a transition absent from
+    ``ALLOWED_TRANSITIONS``. Raised only in ``enforce`` guard mode."""
+
+
+# Terminal states have no outgoing edges.
+_TERMINAL: frozenset[WorkflowLabel] = frozenset(
+    {WorkflowLabel.DONE, WorkflowLabel.REJECTED}
+)
+
+# The per-tick base-sync detour relabels a behind-base PR-having issue to
+# `resolving_conflict`. These are the ONLY states it fires from. Enumerated
+# explicitly here (rather than imported from `base_sync`) so the table is
+# self-describing; `tests/test_state_machine.py` asserts it stays equal to
+# `base_sync._PR_REFRESH_DETOUR_LABELS` so the two cannot drift apart.
+_DETOUR_TO_RESOLVING: frozenset[WorkflowLabel] = frozenset(
+    {
+        WorkflowLabel.VALIDATING, WorkflowLabel.DOCUMENTING,
+        WorkflowLabel.IN_REVIEW, WorkflowLabel.FIXING,
+    }
+)
+
+# Forward ("spine") + drift edges, keyed by source. ``None`` is the entry
+# (unlabeled-pickup) pseudo-state. The universal interrupt edges
+# (`-> done`, `-> rejected`) and the `resolving_conflict` detour are folded
+# in below by `_build_allowed`, so this map holds only the deterministic
+# forward flow.
+_FORWARD: dict[Optional[WorkflowLabel], frozenset[WorkflowLabel]] = {
+    # Entry: an unlabeled issue decomposes, or (DECOMPOSE=off) goes straight
+    # to implementing. It never enters `question` (operator-applied only) and
+    # is never born `blocked` via this path -- children are created `blocked`
+    # directly, bypassing the transition guard.
+    None: frozenset({WorkflowLabel.DECOMPOSING, WorkflowLabel.IMPLEMENTING}),
+    WorkflowLabel.DECOMPOSING: frozenset(
+        {
+            WorkflowLabel.READY, WorkflowLabel.IMPLEMENTING,
+            WorkflowLabel.BLOCKED, WorkflowLabel.UMBRELLA,
+        }
+    ),
+    # `-> decomposing` on each of ready/blocked/umbrella is the user-content
+    # drift re-route (`_route_drift_to_decomposing`).
+    WorkflowLabel.READY: frozenset(
+        {WorkflowLabel.IMPLEMENTING, WorkflowLabel.DECOMPOSING}
+    ),
+    WorkflowLabel.BLOCKED: frozenset(
+        {WorkflowLabel.READY, WorkflowLabel.DECOMPOSING}
+    ),
+    WorkflowLabel.UMBRELLA: frozenset(
+        {WorkflowLabel.DONE, WorkflowLabel.DECOMPOSING}
+    ),
+    WorkflowLabel.IMPLEMENTING: frozenset({WorkflowLabel.VALIDATING}),
+    WorkflowLabel.VALIDATING: frozenset({WorkflowLabel.DOCUMENTING}),
+    WorkflowLabel.DOCUMENTING: frozenset(
+        {WorkflowLabel.IN_REVIEW, WorkflowLabel.VALIDATING}
+    ),
+    WorkflowLabel.IN_REVIEW: frozenset(
+        {WorkflowLabel.FIXING, WorkflowLabel.VALIDATING}
+    ),
+    WorkflowLabel.FIXING: frozenset({WorkflowLabel.VALIDATING}),
+    WorkflowLabel.RESOLVING_CONFLICT: frozenset({WorkflowLabel.VALIDATING}),
+    WorkflowLabel.QUESTION: frozenset({WorkflowLabel.DONE}),
+    WorkflowLabel.DONE: frozenset(),
+    WorkflowLabel.REJECTED: frozenset(),
+}
+
+
+def _build_allowed() -> dict[Optional[WorkflowLabel], frozenset[WorkflowLabel]]:
+    """Fold the universal interrupt edges into every non-terminal source.
+
+    * ``-> done`` / ``-> rejected``: external merge or close can terminalize
+      from any active state -- including any-label child recovery via
+      ``_finalize_if_pr_merged`` on a closed child of a blocked/umbrella
+      parent. So both are allowed from every non-terminal workflow label.
+    * ``-> resolving_conflict``: only from the explicit detour sources.
+
+    The entry pseudo-state (``None``) is deliberately NOT given the
+    interrupt edges -- an unlabeled issue is never terminalized directly.
+    """
+    allowed: dict[Optional[WorkflowLabel], frozenset[WorkflowLabel]] = {}
+    for src, forward in _FORWARD.items():
+        edges = set(forward)
+        if src is not None and src not in _TERMINAL:
+            edges |= {WorkflowLabel.DONE, WorkflowLabel.REJECTED}
+            if src in _DETOUR_TO_RESOLVING:
+                edges.add(WorkflowLabel.RESOLVING_CONFLICT)
+        allowed[src] = frozenset(edges)
+    return allowed
+
+
+ALLOWED_TRANSITIONS: dict[Optional[WorkflowLabel], frozenset[WorkflowLabel]] = (
+    _build_allowed()
+)
+
+
+def is_allowed_transition(
+    current: Optional[WorkflowLabel], new: WorkflowLabel
+) -> bool:
+    """True if relabeling ``current`` -> ``new`` is legal.
+
+    A same-label write (idempotent re-set) is always allowed; it still
+    fires `set_labels` / `stage_enter` exactly as before -- the guard does
+    not suppress those.
+    """
+    if current == new:
+        return True
+    return new in ALLOWED_TRANSITIONS.get(current, frozenset())
+
+
+def guard_transition(
+    current: Optional[WorkflowLabel], new: WorkflowLabel, mode: str
+) -> None:
+    """Apply the configured transition guard at a workflow-label write.
+
+    ``mode`` is the ``WORKFLOW_TRANSITION_GUARD`` setting:
+    * ``off``     -- no check.
+    * ``warn``    -- log a warning on an illegal transition, then proceed.
+    * ``enforce`` -- raise ``IllegalTransition`` on an illegal transition.
+
+    The typo guard (`coerce_workflow_label`) is independent of this and is
+    always strict; this only governs transition *legality*.
+    """
+    if mode == "off" or is_allowed_transition(current, new):
+        return
+    allowed = ", ".join(
+        sorted(str(s) for s in ALLOWED_TRANSITIONS.get(current, frozenset()))
+    )
+    detail = (
+        f"illegal workflow transition "
+        f"{str(current) if current is not None else None!r} -> {str(new)!r}; "
+        f"allowed from there: {allowed or '(none -- terminal state)'}"
+    )
+    if mode == "enforce":
+        raise IllegalTransition(detail)
+    log.warning("%s", detail)

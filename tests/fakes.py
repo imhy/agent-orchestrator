@@ -13,7 +13,7 @@ from datetime import datetime
 from itertools import count
 from typing import Any, Iterable, Optional
 
-from orchestrator import analytics
+from orchestrator import analytics, config
 from orchestrator.github import (
     PINNED_STATE_MARKER,
     PinnedState,
@@ -21,7 +21,11 @@ from orchestrator.github import (
     _write_event_record,
     build_event_record,
 )
-from orchestrator.state_machine import WorkflowLabel, coerce_workflow_label
+from orchestrator.state_machine import (
+    WorkflowLabel,
+    coerce_workflow_label,
+    guard_transition,
+)
 
 
 @dataclass
@@ -277,9 +281,14 @@ class FakeGitHubClient:
     def set_workflow_label(
         self, issue: FakeIssue, new_label: Optional[str]
     ) -> None:
-        # Mirror the real client's strict typo guard so the suite's
-        # fake-backed handler tests exercise the same invariant.
+        # Mirror the real client's strict typo guard + transition guard so
+        # the suite's fake-backed tests exercise the same invariants.
         new_label = coerce_workflow_label(new_label) if new_label else None
+        if new_label is not None:
+            guard_transition(
+                self.workflow_label(issue), new_label,
+                config.WORKFLOW_TRANSITION_GUARD,
+            )
         keep = [l for l in issue.labels if l.name not in WORKFLOW_LABELS]
         if new_label:
             keep.append(FakeLabel(new_label))

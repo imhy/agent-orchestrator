@@ -335,6 +335,29 @@ MAX_PARALLEL_ISSUES_GLOBAL: int = _parse_positive_int(
 )
 
 
+def _parse_transition_guard(raw: str) -> str:
+    """Parse `WORKFLOW_TRANSITION_GUARD`: one of off / warn / enforce.
+
+    Governs only the transition-*legality* check in `set_workflow_label`
+    (the typo guard is always strict). Default `warn` keeps production
+    safe while the declared transition table soaks against live issues;
+    flip to `enforce` once the warn logs are clean. An invalid value
+    aborts at import so a typo can't silently disable the guard.
+    """
+    value = (raw or "").strip().lower() or "warn"
+    if value not in ("off", "warn", "enforce"):
+        raise SystemExit(
+            f"orchestrator: WORKFLOW_TRANSITION_GUARD={raw!r} is invalid; "
+            "expected one of: off, warn, enforce"
+        )
+    return value
+
+
+WORKFLOW_TRANSITION_GUARD: str = _parse_transition_guard(
+    os.environ.get("WORKFLOW_TRANSITION_GUARD", "")
+)
+
+
 @dataclass(frozen=True)
 class RepoSpec:
     """Per-repo identity threaded through the workflow.
