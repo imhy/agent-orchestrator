@@ -19,6 +19,17 @@ A second control label `backlog` is created for postponed work. While present on
 
 A third control label `community_contribution` is applied by the per-tick open-PR sweep when `ALLOWED_ISSUE_AUTHORS` is configured: any open PR whose author is not in the allowlist is labeled and `HITL_HANDLE` is @-mentioned once per PR so a human reviews community-submitted work. The orchestrator does not drive these PRs through the workflow; the label is a pure "needs a human" signal. With `ALLOWED_ISSUE_AUTHORS` empty (the default), the sweep is a no-op.
 
+### Typed states and the transition guard
+
+The label vocabulary is defined once in [`orchestrator/state_machine.py`](../orchestrator/state_machine.py): `WorkflowLabel` (a `StrEnum`) is the single source of truth for the workflow states, and `ControlLabel` holds the modifiers (`backlog`, `hold_base_sync`). Because `StrEnum` members *are* their wire strings, the GitHub labels, pinned-state JSON, and ordinary string comparisons are unchanged — the enum only gives the names one authoritative definition.
+
+Two guards run at `GitHubClient.set_workflow_label` (the single label-write chokepoint; `create_child_issue` shares the typo guard for its direct write):
+
+- **Typo guard (always strict).** Every write coerces through `coerce_workflow_label`; a label name not in `WorkflowLabel` raises immediately, instead of being applied as a literal GitHub label that the next tick would silently treat as unlabeled-pickup.
+- **Transition guard (`WORKFLOW_TRANSITION_GUARD` = `off` / `warn` / `enforce`, default `warn`).** An illegal `current → new` relabel is checked against the declared `ALLOWED_TRANSITIONS` table. `warn` logs and proceeds (the safe default while the table soaks on live issues); `enforce` raises `IllegalTransition`; `off` disables the check. A same-label re-set is always allowed and still fires `stage_enter`.
+
+`ALLOWED_TRANSITIONS` is two-tier: a **strict forward spine** (e.g. `implementing → validating → documenting`) plus **universal interrupt edges** that fire from external events — `→ done` and `→ rejected` are allowed from *any* non-terminal state (external merge / close, including any-label child recovery via `_finalize_if_pr_merged`), and `→ resolving_conflict` is allowed from the explicit base-sync detour sources (`validating`, `documenting`, `in_review`, `fixing`). The entry pseudo-state (unlabeled pickup) only reaches `decomposing` / `implementing`; `question` is operator-applied and has no inbound edge; `done` / `rejected` are terminal. Operator relabels via the GitHub UI bypass both guards (they do not go through `set_workflow_label`), so the guard never fights a human.
+
 | Label | Meaning |
 |---|---|
 | _(none)_ | Open issue not yet picked up by the orchestrator. |

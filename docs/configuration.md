@@ -149,6 +149,7 @@ The two caps below are the levers:
 | ------------------------------ | ------- | ---------------------------------------------------------------------------------------------------- |
 | `MAX_PARALLEL_ISSUES_PER_REPO` | `1`     | per-repo cap on concurrent in-flight per-issue handlers. Each `REPOS` entry can override via its fifth pipe-separated field. Must be a positive integer. |
 | `MAX_PARALLEL_ISSUES_GLOBAL`   | `3`     | global cap across all configured repos. Must be a positive integer; raise only with the CPU / memory headroom to run that many agent CLIs at once. Umbrella-only family buckets are cap-exempt and run on a dedicated executor. |
+| `WORKFLOW_TRANSITION_GUARD`    | `warn`  | governs the workflow-label transition-legality check in `set_workflow_label` against the declared `ALLOWED_TRANSITIONS` table (see [`state-machine.md`](state-machine.md#typed-states-and-the-transition-guard)). `warn` logs an illegal transition and proceeds; `enforce` raises; `off` disables it. The label *typo* guard is always strict regardless of this setting. Invalid values abort at startup. |
 
 Both caps are enforced by a single `IssueScheduler` (`orchestrator/scheduler.py`) built once at startup and threaded through every `workflow.tick` call. A submit is skipped this tick (and retried next pass) when:
 
@@ -365,6 +366,7 @@ Each `--once` invocation is a fresh Python process and reads the current `.env` 
 | `ANALYTICS_DB_URL` | next `python -m orchestrator.analytics.sync` invocation, and next `streamlit run orchestrator/dashboard.py` start (the dashboard reads it from the imported analytics module, so a browser reload is not enough — relaunch Streamlit). The polling loop does not read this setting. |
 | `DASHBOARD_PARALLEL_READS` | next `streamlit run orchestrator/dashboard.py` start. Parsed at dashboard import. |
 | `MAX_PARALLEL_ISSUES_PER_REPO`, `MAX_PARALLEL_ISSUES_GLOBAL` | next Python start. Per-`REPOS` `parallel_limit` overrides take precedence over `MAX_PARALLEL_ISSUES_PER_REPO`. |
+| `WORKFLOW_TRANSITION_GUARD` | next Python start (parsed at config import). |
 | `DEV_AGENT`, `DECOMPOSE_AGENT` | next Python start, **except** for issues whose pinned state already names a `dev_agent` / `decomposer_agent` / `question_agent` — those keep the pinned spec until the issue reaches `done` or `rejected` |
 | `REVIEW_AGENT` | next reviewer spawn after the next Python start (not pinned per issue) |
 | `GITHUB_TOKEN` | not loaded from `.env`. Update the process environment or rewrite the file at `ORCHESTRATOR_TOKEN_FILE` (default `~/.config/<owner>/<repo>/token`) before the next start |

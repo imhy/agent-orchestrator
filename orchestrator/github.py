@@ -22,7 +22,7 @@ from github.PullRequest import PullRequest
 from github.Repository import Repository
 
 from . import analytics, config
-from .state_machine import WorkflowLabel, coerce_workflow_label
+from .state_machine import WorkflowLabel, coerce_workflow_label, guard_transition
 
 log = logging.getLogger(__name__)
 
@@ -319,6 +319,13 @@ class GitHubClient:
         # next tick would silently treat as unlabeled-pickup. Accepts a
         # `WorkflowLabel` or its string value.
         new = coerce_workflow_label(new_label) if new_label else None
+        if new is not None:
+            # Transition guard (mode-controlled, default `warn`): reject an
+            # illegal `current -> new` relabel. Read the current label off
+            # the live issue first; a same-label re-set is always allowed.
+            guard_transition(
+                self.workflow_label(issue), new, config.WORKFLOW_TRANSITION_GUARD,
+            )
         keep = [l.name for l in issue.labels if l.name not in WORKFLOW_LABELS]
         if new is not None:
             keep.append(new)

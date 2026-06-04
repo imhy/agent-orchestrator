@@ -24,6 +24,8 @@ The `orchestrator/` package is split between a slim facade (`workflow.py`), per-
 orchestrator/
   main.py               entry point, polling loop, self-restart guard
   config.py             env / token loading, secret handling, backend validation
+  state_machine.py      typed label vocabulary, transition table, typo guard
+                        and transition guard
   github.py             PyGithub wrapper, label bootstrap, pinned-state comment
   agents.py             coding-agent subprocess runner (codex/claude dispatch)
   scheduler.py          process-local IssueScheduler (global / per-repo caps,
