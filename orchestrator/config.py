@@ -377,9 +377,10 @@ class RepoSpec:
     `REPOS` entry can override it via the optional fifth pipe-separated
     field. The global `MAX_PARALLEL_ISSUES_GLOBAL` ceiling applies across
     all repos to cap-counted handlers regardless of any one repo's
-    `parallel_limit`; umbrella-only family buckets are cap-exempt by design
-    (a parent dep-graph walk must always get its turn) and are excluded
-    from both `parallel_limit` and `MAX_PARALLEL_ISSUES_GLOBAL`.
+    `parallel_limit`; no-agent family buckets (`blocked` / `umbrella`) are
+    cap-exempt by design (a parent dep-graph walk must always get its turn)
+    and are excluded from both `parallel_limit` and
+    `MAX_PARALLEL_ISSUES_GLOBAL`.
     """
 
     slug: str

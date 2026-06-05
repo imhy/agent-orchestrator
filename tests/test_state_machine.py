@@ -179,6 +179,7 @@ class IsAllowedTransitionTest(unittest.TestCase):
             (None, WorkflowLabel.IMPLEMENTING),
             (WorkflowLabel.IMPLEMENTING, WorkflowLabel.VALIDATING),
             (WorkflowLabel.VALIDATING, WorkflowLabel.DOCUMENTING),
+            (WorkflowLabel.VALIDATING, WorkflowLabel.FIXING),
             (WorkflowLabel.DOCUMENTING, WorkflowLabel.IN_REVIEW),
             (WorkflowLabel.IN_REVIEW, WorkflowLabel.FIXING),
             (WorkflowLabel.FIXING, WorkflowLabel.VALIDATING),
@@ -341,6 +342,12 @@ class SetWorkflowLabelGuardWiringTest(unittest.TestCase):
         with patch.object(config, "WORKFLOW_TRANSITION_GUARD", "enforce"):
             gh.set_workflow_label(issue, WorkflowLabel.DOCUMENTING)
         self.assertEqual(gh.workflow_label(issue), WorkflowLabel.DOCUMENTING)
+
+    def test_enforce_allows_validating_fix_loop_relabel(self) -> None:
+        gh, issue = self._issue()
+        with patch.object(config, "WORKFLOW_TRANSITION_GUARD", "enforce"):
+            gh.set_workflow_label(issue, WorkflowLabel.FIXING)
+        self.assertEqual(gh.workflow_label(issue), WorkflowLabel.FIXING)
 
 
 if __name__ == "__main__":

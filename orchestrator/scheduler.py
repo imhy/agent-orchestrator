@@ -17,8 +17,8 @@ API:
   per-repo cap reached, family slot already taken, or the scheduler has
   been shut down). ``cap_exempt=True`` skips the global and per-repo cap
   checks (and does not consume a cap slot) while still honoring the
-  duplicate-active gate and the family mutex; used by the umbrella-only
-  family bucket so a pure label-walk parent never gets blocked by
+  duplicate-active gate and the family mutex; used by no-agent family
+  buckets so a pure label / dep-graph walk never gets blocked by
   ordinary implementation work this tick.
 * ``reap()`` -- nonblocking. Drains completed futures, logs any worker
   exception, returns the number of futures drained. Completion markers
@@ -64,8 +64,8 @@ _EXEMPT_POOL_WORKERS: int = 32
 Deliberately independent of ``global_cap``: cap-exempt work is by
 definition not subject to ``MAX_PARALLEL_ISSUES_GLOBAL``, so sizing
 this pool against the cap would silently re-impose it. A multi-repo
-orchestrator can have one umbrella bucket per repo in flight at once,
-and umbrella handlers are short label/dep-graph walks, so a fixed
+orchestrator can have one no-agent family bucket per repo in flight at
+once, and those handlers are short label / dep-graph walks, so a fixed
 generous bound covers any realistic deployment without spinning up
 unbounded threads.
 """
@@ -96,19 +96,20 @@ class IssueScheduler:
             max_workers=self._global_cap,
             thread_name_prefix=thread_name_prefix,
         )
-        # Cap-exempt submits (the umbrella-only family bucket) run on
+        # Cap-exempt submits (no-agent family buckets) run on
         # this dedicated executor so they cannot queue behind cap-counted
         # work. If they shared the main pool, an exempt submit accepted
         # past the cap would still wait for a cap-counted worker to exit
         # before the executor handed it a thread, defeating the whole
-        # "umbrella always runs this tick" contract. Sized INDEPENDENTLY
-        # of ``global_cap`` so a tight cap (e.g. ``global_cap=1``) does
-        # not transitively cap umbrella throughput across repos: a
-        # deployment with N repos can have N umbrella buckets in flight
-        # at once even though only one ordinary worker may run at a
-        # time. The fixed bound is intentionally generous -- umbrella
-        # handlers are fast (label/dep-graph walk, no agent, no
-        # worktree), so a single shared pool of this size accommodates
+        # "no-agent family bucket always runs this tick" contract. Sized
+        # INDEPENDENTLY of ``global_cap`` so a tight cap (e.g.
+        # ``global_cap=1``) does not transitively cap no-agent family
+        # throughput across repos: a deployment with N repos can have N
+        # exempt buckets in flight at once even though only one ordinary
+        # worker may run at a time. The fixed bound is intentionally
+        # generous -- no-agent family handlers are fast (label /
+        # dep-graph walk, no agent, no worktree), so a single shared pool
+        # of this size accommodates
         # any realistic multi-repo deployment without spinning up
         # unbounded threads.
         self._exempt_executor = ThreadPoolExecutor(
@@ -200,9 +201,9 @@ class IssueScheduler:
         the duplicate-active gate without consuming a cap slot. The
         family mutex still applies when ``family=True`` so the exempt
         bucket cannot overlap with a concurrent family worker on the
-        same repo. Used by the umbrella-only family bucket: an umbrella
-        issue is a pure label aggregation that must always get its turn,
-        so ordinary implementation work this tick cannot block it.
+        same repo. Used by no-agent family buckets: blocked / umbrella
+        parent dep-graph walks must always get their turn, so ordinary
+        implementation work this tick cannot block them.
 
         The override ``per_repo_cap`` is the per-spec ``parallel_limit``
         from ``RepoSpec`` -- the issue allows different repos to declare

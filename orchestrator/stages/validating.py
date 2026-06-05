@@ -1107,7 +1107,7 @@ def _handle_validating(gh: GitHubClient, spec: RepoSpec, issue: Issue) -> None:
     # and bounces back to `validating` so the reviewer reruns. Without the
     # pre-spawn flip, a crash would leave a stale `validating` label over
     # work the reviewer never produced a verdict for.
-    gh.set_workflow_label(issue, "fixing")
+    gh.set_workflow_label(issue, WorkflowLabel.FIXING)
     gh.write_pinned_state(issue, state)
 
     fix_prompt = _wf._build_fix_prompt(feedback)
@@ -1143,5 +1143,5 @@ def _handle_validating(gh: GitHubClient, spec: RepoSpec, issue: Issue) -> None:
     # Pushed fix: bump the round and hand back to `validating` so the
     # reviewer re-evaluates the new head next tick.
     state.set("review_round", round_n + 1)
-    gh.set_workflow_label(issue, "validating")
+    gh.set_workflow_label(issue, WorkflowLabel.VALIDATING)
     gh.write_pinned_state(issue, state)
