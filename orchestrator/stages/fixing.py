@@ -292,7 +292,7 @@ def _handle_fixing(gh: GitHubClient, spec: RepoSpec, issue: Issue) -> None:
             state.set("awaiting_human", False)
             state.set("park_reason", None)
             _clear_pending_fix_bookmarks(state)
-            gh.set_workflow_label(issue, "validating")
+            gh.set_workflow_label(issue, WorkflowLabel.VALIDATING)
             gh.write_pinned_state(issue, state)
             return
         if not new_feedback:

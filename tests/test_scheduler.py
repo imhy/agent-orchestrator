@@ -799,9 +799,9 @@ class TrackActiveContextManagerTest(unittest.TestCase):
 class CapExemptSubmitTest(unittest.TestCase):
     """``submit(cap_exempt=True)`` skips the global and per-repo cap
     counters while still honoring the duplicate-active gate and the
-    family mutex. Production uses this for the umbrella-only family
-    bucket so an umbrella aggregation always gets its turn even when
-    the parallel caps are saturated by ordinary implementation work.
+    family mutex. Production uses this for no-agent family buckets so
+    blocked / umbrella parent dep-graph walks always get their turn even
+    when the parallel caps are saturated by ordinary implementation work.
     """
 
     def test_cap_exempt_submit_bypasses_global_cap(self) -> None:
@@ -896,8 +896,8 @@ class CapExemptSubmitTest(unittest.TestCase):
 
     def test_cap_exempt_submit_still_honors_family_mutex(self) -> None:
         # The cap exemption only bypasses the cap counters; family-aware
-        # submits still serialize per repo so an exempt umbrella bucket
-        # cannot overlap with a regular (non-exempt) family worker.
+        # submits still serialize per repo so an exempt no-agent family
+        # bucket cannot overlap with a regular (non-exempt) family worker.
         sched = IssueScheduler(global_cap=10, per_repo_cap=10)
         self.addCleanup(sched.shutdown)
         start = threading.Event()
@@ -965,10 +965,10 @@ class CapExemptSubmitTest(unittest.TestCase):
     def test_cap_exempt_pool_is_independent_of_global_cap(self) -> None:
         # Regression: a prior implementation sized the cap-exempt
         # executor at ``global_cap``. With ``global_cap=1`` and two
-        # umbrella-only buckets on different repos, the second
+        # no-agent family buckets on different repos, the second
         # exempt submit was accepted past the cap check but then
         # queued at the executor until the first exited -- so
-        # umbrella throughput was still transitively capped by
+        # exempt-bucket throughput was still transitively capped by
         # ``MAX_PARALLEL_ISSUES_GLOBAL``. The fix sizes the exempt
         # pool independently of ``global_cap`` so multiple exempt
         # buckets can run concurrently regardless of how tight the
@@ -989,7 +989,7 @@ class CapExemptSubmitTest(unittest.TestCase):
             )
             self.assertTrue(start_a.wait(timeout=2.0))
 
-            # A second umbrella-only bucket on a DIFFERENT repo must
+            # A second no-agent family bucket on a DIFFERENT repo must
             # start immediately even though ``global_cap=1`` and the
             # first exempt worker is still in flight. The family
             # mutex is per-repo, so the cross-repo claim is fine; the
@@ -1005,7 +1005,7 @@ class CapExemptSubmitTest(unittest.TestCase):
             )
             self.assertTrue(
                 start_b.wait(timeout=2.0),
-                "second umbrella bucket queued behind the first -- "
+                "second exempt family bucket queued behind the first -- "
                 "exempt executor is still capped by global_cap",
             )
         finally:

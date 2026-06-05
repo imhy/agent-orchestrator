@@ -17,9 +17,8 @@ processing without being workflow states themselves -- an issue is
 states and never flow through `set_workflow_label` or the transition
 table.
 
-The transition table and guard live in this module too (added alongside
-`validate_transition`); `github.set_workflow_label` is the single
-chokepoint that calls them.
+The transition table and guard live in this module too; `github.set_workflow_label`
+is the single chokepoint that calls them.
 """
 from __future__ import annotations
 
@@ -129,7 +128,9 @@ _FORWARD: dict[Optional[WorkflowLabel], frozenset[WorkflowLabel]] = {
         {WorkflowLabel.DONE, WorkflowLabel.DECOMPOSING}
     ),
     WorkflowLabel.IMPLEMENTING: frozenset({WorkflowLabel.VALIDATING}),
-    WorkflowLabel.VALIDATING: frozenset({WorkflowLabel.DOCUMENTING}),
+    WorkflowLabel.VALIDATING: frozenset(
+        {WorkflowLabel.DOCUMENTING, WorkflowLabel.FIXING}
+    ),
     WorkflowLabel.DOCUMENTING: frozenset(
         {WorkflowLabel.IN_REVIEW, WorkflowLabel.VALIDATING}
     ),
