@@ -724,6 +724,17 @@ issue. GitHub issue numbers are strictly positive, so 0 is safe.
 """
 
 
+def _issue_is_closed(issue) -> bool:
+    """True when the issue is closed.
+
+    Tolerant of both shapes the dispatcher sees: PyGithub's ``Issue.state``
+    (``"open"`` / ``"closed"``) and the in-memory fake's ``closed`` bool.
+    """
+    return bool(getattr(issue, "closed", False)) or (
+        getattr(issue, "state", "open") == "closed"
+    )
+
+
 def _dispatch_via_scheduler(
     gh: GitHubClient, spec: RepoSpec, scheduler: IssueScheduler,
 ) -> None:
@@ -789,11 +800,24 @@ def _dispatch_via_scheduler(
     behind a "not yet" hold under ``parallel_limit=1``. The family mutex
     still applies, so a follow-up tick that finds another family issue
     still serializes against this bucket.
+
+    Closed fan-out issues are likewise submitted ``cap_exempt=True``: a
+    closed issue carrying a sweep label (``in_review`` / ``fixing`` /
+    ``resolving_conflict`` / ``question`` / ...) only runs a terminal
+    finalization (flip to ``done`` / ``rejected`` + branch cleanup) with no
+    agent spawn, so it must not be starved behind active agent work -- a
+    merged-PR issue could otherwise sit closed-but-labeled for many ticks
+    while a sibling ``validating`` / ``documenting`` agent holds the only
+    per-repo slot.
     """
     per_repo_cap = max(1, int(getattr(spec, "parallel_limit", 1) or 1))
     family_numbers: list[int] = []
     family_labels: list[Optional[str]] = []
     fanout_numbers: list[int] = []
+    # Closed fan-out issues only need a terminal finalization (flip to
+    # `done` / `rejected` + branch cleanup); their handlers spawn no agent.
+    # Tracked so they can be submitted cap-exempt below.
+    fanout_closed: set[int] = set()
     for issue in gh.list_pollable_issues():
         # `backlog` is an operator "not yet" hold: the issue sits outside
         # the state machine until the label is removed. Drop it BEFORE the
@@ -824,6 +848,8 @@ def _dispatch_via_scheduler(
             family_labels.append(label)
         else:
             fanout_numbers.append(issue_number)
+            if _issue_is_closed(issue):
+                fanout_closed.add(issue_number)
 
     if family_numbers:
         # A family bucket is cap-exempt only when EVERY issue in it this
@@ -910,6 +936,13 @@ def _dispatch_via_scheduler(
             n,
             _run,
             family=False,
+            # A closed issue's handler is a cheap terminal finalization with
+            # no agent spawn -- exempt it from the per-repo / global caps so
+            # a merged-PR or closed-question issue flips to `done` promptly
+            # instead of being starved behind active agent work under
+            # `parallel_limit=1` (mirrors the `_CAP_EXEMPT_FAMILY_LABELS`
+            # exemption for `blocked` / `umbrella`).
+            cap_exempt=(n in fanout_closed),
             per_repo_cap=per_repo_cap,
         )
 

@@ -262,15 +262,17 @@ class TickViaSchedulerTest(unittest.TestCase):
                     timer.cancel()
                 self.assertFalse(sched.is_active("acme/widget", drained))
 
-                # The handler stub does not flip labels, so close the
-                # FakeIssue directly to model "advanced past this
-                # stage" -- in production the drained worker would
-                # have relabeled / closed the issue and the next
-                # enumeration would skip it. Without this, the next
-                # tick would re-admit the drained issue and take the
-                # newly freed slot back, starving the previously-
-                # skipped one.
+                # The handler stub does not flip labels, so model the
+                # drained worker finalizing the issue to `done` -- in
+                # production it would relabel to a terminal (non-sweep)
+                # label, so the next enumeration drops it. Merely closing
+                # while KEEPING a sweep label is not enough: a closed
+                # sweep-labeled issue stays pollable AND is now submitted
+                # cap-exempt (a cheap terminal finalize), so it would
+                # re-run every tick and take the freed slot back, starving
+                # the previously-skipped one.
                 gh._issues[drained].closed = True
+                gh._issues[drained].labels = [FakeLabel("done")]
 
                 # Tick 2: previously-skipped issue is now admitted.
                 workflow.tick(
@@ -1263,6 +1265,169 @@ class BacklogDispatchFilterTest(unittest.TestCase):
                 3, processed,
                 "backlog #3 must be filtered at dispatch, never processed",
             )
+
+
+class ClosedFanoutCapExemptionTest(unittest.TestCase):
+    """A CLOSED fan-out issue (a merged-PR or closed-question issue still
+    carrying its sweep label) only runs a terminal finalization (flip to
+    `done` / `rejected` + branch cleanup) with no agent spawn, so the
+    dispatcher submits it `cap_exempt=True`. It must finalize promptly even
+    when an open fan-out issue holds the only per-repo slot under
+    `parallel_limit=1` -- otherwise a merged-PR issue sits closed-but-
+    labeled for many ticks behind a sibling validating/documenting agent.
+    """
+
+    def _spec(self, parallel_limit: int = 1) -> config.RepoSpec:
+        return config.RepoSpec(
+            slug="acme/widget",
+            target_root=Path("/tmp/orchestrator-test-target-root"),
+            base_branch="main",
+            parallel_limit=parallel_limit,
+        )
+
+    def _wait_idle(self, sched, repo_slug: str, deadline_s: float = 5.0) -> None:
+        import threading as _threading
+        deadline = _threading.Event()
+        timer = _threading.Timer(deadline_s, deadline.set)
+        timer.daemon = True
+        timer.start()
+        try:
+            while sched.active_count(repo_slug) > 0 and not deadline.is_set():
+                pass
+        finally:
+            timer.cancel()
+        self.assertEqual(sched.active_count(repo_slug), 0)
+
+    def test_closed_fanout_runs_when_per_repo_cap_is_saturated(self) -> None:
+        # Per-repo cap is 1 and an open `validating` fanout issue holds the
+        # slot. A CLOSED `in_review` issue on the same repo must still run
+        # this tick: it is submitted cap-exempt so its terminal finalize
+        # is not starved by the active reviewer.
+        import threading
+        from orchestrator.scheduler import IssueScheduler
+        sched = IssueScheduler(global_cap=8, per_repo_cap=1)
+        self.addCleanup(sched.shutdown)
+        gh = FakeGitHubClient()
+        gh.add_issue(make_issue(1, label="validating"))
+        closed = make_issue(2, label="in_review")
+        closed.closed = True
+        gh.add_issue(closed)
+
+        starts: dict[int, threading.Event] = {
+            1: threading.Event(), 2: threading.Event(),
+        }
+        releases: dict[int, threading.Event] = {
+            1: threading.Event(), 2: threading.Event(),
+        }
+
+        def fake_process(_gh, _spec, issue) -> None:
+            starts[issue.number].set()
+            releases[issue.number].wait(timeout=5.0)
+
+        try:
+            with patch.object(workflow, "_refresh_base_and_worktrees"), \
+                 patch.object(workflow, "_process_issue", side_effect=fake_process):
+                workflow.tick(gh, self._spec(parallel_limit=1), scheduler=sched)
+                self.assertTrue(
+                    starts[1].wait(timeout=2.0),
+                    "open validating #1 did not start",
+                )
+                self.assertTrue(
+                    starts[2].wait(timeout=2.0),
+                    "closed in_review #2 was starved by the per-repo cap -- "
+                    "a terminal finalization must run cap-exempt",
+                )
+        finally:
+            for ev in releases.values():
+                ev.set()
+        self._wait_idle(sched, "acme/widget")
+
+    def test_closed_fanout_does_not_inflate_cap_counters(self) -> None:
+        # While a closed fan-out finalize is in flight, the scheduler's
+        # cap counters stay at zero (its worker lives in the cap-exempt
+        # tracked set), so a concurrent open fan-out submit is not skipped.
+        import threading
+        from orchestrator.scheduler import IssueScheduler
+        sched = IssueScheduler(global_cap=4, per_repo_cap=4)
+        self.addCleanup(sched.shutdown)
+        gh = FakeGitHubClient()
+        closed = make_issue(1, label="in_review")
+        closed.closed = True
+        gh.add_issue(closed)
+
+        start = threading.Event()
+        release = threading.Event()
+
+        def fake_process(_gh, _spec, _issue) -> None:
+            start.set()
+            release.wait(timeout=5.0)
+
+        try:
+            with patch.object(workflow, "_refresh_base_and_worktrees"), \
+                 patch.object(workflow, "_process_issue", side_effect=fake_process):
+                workflow.tick(gh, self._spec(parallel_limit=4), scheduler=sched)
+                self.assertTrue(start.wait(timeout=2.0))
+                self.assertEqual(sched.active_count(), 0)
+                self.assertEqual(sched.active_count("acme/widget"), 0)
+                # Active tracking still works for the in-flight finalize.
+                self.assertTrue(sched.is_active("acme/widget", 1))
+        finally:
+            release.set()
+        self._wait_idle(sched, "acme/widget")
+
+    def test_open_fanout_is_not_cap_exempt(self) -> None:
+        # The exemption is closed-only: an OPEN fan-out issue beyond the
+        # per-repo cap is still skipped this tick (no cap-exempt smuggling).
+        import threading
+        from orchestrator.scheduler import IssueScheduler
+        sched = IssueScheduler(global_cap=8, per_repo_cap=1)
+        self.addCleanup(sched.shutdown)
+        gh = FakeGitHubClient()
+        gh.add_issue(make_issue(1, label="validating"))
+        gh.add_issue(make_issue(2, label="in_review"))  # OPEN -> cap-counted
+
+        starts: dict[int, threading.Event] = {
+            1: threading.Event(), 2: threading.Event(),
+        }
+        release = threading.Event()
+
+        def fake_process(_gh, _spec, issue) -> None:
+            starts[issue.number].set()
+            release.wait(timeout=5.0)
+
+        try:
+            with patch.object(workflow, "_refresh_base_and_worktrees"), \
+                 patch.object(workflow, "_process_issue", side_effect=fake_process):
+                workflow.tick(gh, self._spec(parallel_limit=1), scheduler=sched)
+                self.assertTrue(starts[1].wait(timeout=2.0))
+                # #2 is open, so the per-repo cap (1, held by #1) skips it.
+                self.assertFalse(
+                    starts[2].wait(timeout=1.0),
+                    "open in_review #2 should be cap-skipped, not exempt",
+                )
+        finally:
+            release.set()
+        self._wait_idle(sched, "acme/widget")
+
+
+class IssueIsClosedHelperTest(unittest.TestCase):
+    """`_issue_is_closed` tolerates both the PyGithub (`state`) and the
+    in-memory-fake (`closed`) shapes."""
+
+    def test_detects_fake_closed_bool(self) -> None:
+        issue = make_issue(1, label="in_review")
+        self.assertFalse(workflow._issue_is_closed(issue))
+        issue.closed = True
+        self.assertTrue(workflow._issue_is_closed(issue))
+
+    def test_detects_pygithub_state_string(self) -> None:
+        from types import SimpleNamespace
+        self.assertTrue(
+            workflow._issue_is_closed(SimpleNamespace(state="closed")),
+        )
+        self.assertFalse(
+            workflow._issue_is_closed(SimpleNamespace(state="open")),
+        )
 
 
 if __name__ == "__main__":
