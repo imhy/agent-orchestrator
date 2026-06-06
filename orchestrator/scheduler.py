@@ -18,7 +18,8 @@ API:
   been shut down). ``cap_exempt=True`` skips the global and per-repo cap
   checks (and does not consume a cap slot) while still honoring the
   duplicate-active gate and the family mutex; used by no-agent family
-  buckets so a pure label / dep-graph walk never gets blocked by
+  buckets and closed-issue terminal finalizations so a pure label /
+  dep-graph walk or a cheap done/rejected flip never gets blocked by
   ordinary implementation work this tick.
 * ``reap()`` -- nonblocking. Drains completed futures, logs any worker
   exception, returns the number of futures drained. Completion markers
@@ -64,10 +65,13 @@ _EXEMPT_POOL_WORKERS: int = 32
 Deliberately independent of ``global_cap``: cap-exempt work is by
 definition not subject to ``MAX_PARALLEL_ISSUES_GLOBAL``, so sizing
 this pool against the cap would silently re-impose it. A multi-repo
-orchestrator can have one no-agent family bucket per repo in flight at
-once, and those handlers are short label / dep-graph walks, so a fixed
-generous bound covers any realistic deployment without spinning up
-unbounded threads.
+orchestrator can have one no-agent family bucket per repo plus a handful
+of closed-issue terminal finalizations in flight at once, and those
+handlers are short (label / dep-graph walk, or a done/rejected flip with
+branch cleanup), so a fixed generous bound covers any realistic
+deployment without spinning up unbounded threads. A rare burst past the
+bound (e.g. many PRs merged at once) simply queues on this executor and
+drains quickly -- still never blocked by cap-counted agent work.
 """
 
 
@@ -96,20 +100,20 @@ class IssueScheduler:
             max_workers=self._global_cap,
             thread_name_prefix=thread_name_prefix,
         )
-        # Cap-exempt submits (no-agent family buckets) run on
-        # this dedicated executor so they cannot queue behind cap-counted
-        # work. If they shared the main pool, an exempt submit accepted
-        # past the cap would still wait for a cap-counted worker to exit
-        # before the executor handed it a thread, defeating the whole
-        # "no-agent family bucket always runs this tick" contract. Sized
-        # INDEPENDENTLY of ``global_cap`` so a tight cap (e.g.
-        # ``global_cap=1``) does not transitively cap no-agent family
+        # Cap-exempt submits (no-agent family buckets and closed-issue
+        # terminal finalizations) run on this dedicated executor so they
+        # cannot queue behind cap-counted work. If they shared the main
+        # pool, an exempt submit accepted past the cap would still wait
+        # for a cap-counted worker to exit before the executor handed it a
+        # thread, defeating the whole "exempt work always runs this tick"
+        # contract. Sized INDEPENDENTLY of ``global_cap`` so a tight cap
+        # (e.g. ``global_cap=1``) does not transitively cap exempt
         # throughput across repos: a deployment with N repos can have N
         # exempt buckets in flight at once even though only one ordinary
         # worker may run at a time. The fixed bound is intentionally
-        # generous -- no-agent family handlers are fast (label /
-        # dep-graph walk, no agent, no worktree), so a single shared pool
-        # of this size accommodates
+        # generous -- exempt handlers are fast (label / dep-graph walk, or
+        # a done/rejected flip with branch cleanup; no agent), so a single
+        # shared pool of this size accommodates
         # any realistic multi-repo deployment without spinning up
         # unbounded threads.
         self._exempt_executor = ThreadPoolExecutor(
@@ -201,9 +205,11 @@ class IssueScheduler:
         the duplicate-active gate without consuming a cap slot. The
         family mutex still applies when ``family=True`` so the exempt
         bucket cannot overlap with a concurrent family worker on the
-        same repo. Used by no-agent family buckets: blocked / umbrella
-        parent dep-graph walks must always get their turn, so ordinary
-        implementation work this tick cannot block them.
+        same repo. Used by no-agent family buckets (blocked / umbrella
+        parent dep-graph walks) and closed-issue terminal finalizations
+        (a merged-PR / closed-question issue's cheap done/rejected flip):
+        both must always get their turn, so ordinary implementation work
+        this tick cannot block them.
 
         The override ``per_repo_cap`` is the per-spec ``parallel_limit``
         from ``RepoSpec`` -- the issue allows different repos to declare
