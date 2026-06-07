@@ -74,16 +74,18 @@ def _pr_head_orchestrator_produced(state: PinnedState, pr) -> bool:
     """True when the remote PR head is a SHA the orchestrator itself recorded.
 
     Guards the force-publish of a diverged-but-already-rebased branch
-    (the `behind > 0` exception in `_handle_resolving_conflict`): only the
-    orchestrator's own prior head (`docs_checked_sha` / `agent_approved_sha`)
-    is safe to overwrite. An unrecognized head may carry a commit pushed
-    directly to the PR branch, so a divergence from it must stay parked.
+    (the `behind > 0` exception in `_handle_resolving_conflict`): the
+    orchestrator's own prior head -- the SHA `_handle_documenting`
+    persists as `docs_checked_sha` on its success exits -- is the one
+    case we can prove is safe to overwrite. An unrecognized head may
+    carry a commit pushed directly to the PR branch, so a divergence
+    from it must stay parked. PR heads from earlier in the lifecycle
+    (the initial implementing push, an intermediate fixing push) are
+    not currently recorded anywhere in pinned state, so the exception
+    declines those by design rather than guessing.
     """
     head = getattr(getattr(pr, "head", None), "sha", None) or ""
-    return bool(head) and head in {
-        state.get("docs_checked_sha"),
-        state.get("agent_approved_sha"),
-    }
+    return bool(head) and head == state.get("docs_checked_sha")
 
 
 def _already_rebased_onto_base(spec: RepoSpec, wt: Path) -> bool:
@@ -94,15 +96,23 @@ def _already_rebased_onto_base(spec: RepoSpec, wt: Path) -> bool:
     base commit is missing from HEAD. Used to recognize a worktree the
     dev already rebased in an earlier run -- a no-op rebase that only
     needs publishing, not the diverged-branch park.
+
+    Fails closed on fetch failure: a stale `<remote>/<base>` ref would
+    let `rev-list HEAD..<remote>/<base>` report "no missing commits"
+    purely because the local mirror predates the real base tip, which
+    would incorrectly enable the force-publish path without proving HEAD
+    is on the current base.
     """
     from .. import workflow as _wf
 
-    _wf._authed_fetch(
+    fetch = _wf._authed_fetch(
         spec,
         f"+refs/heads/{spec.base_branch}:"
         f"refs/remotes/{spec.remote_name}/{spec.base_branch}",
         cwd=wt,
     )
+    if fetch.returncode != 0:
+        return False
     r = _wf._git_hardened(
         "rev-list", "--count",
         f"HEAD..{spec.remote_name}/{spec.base_branch}", cwd=wt,
@@ -344,6 +354,7 @@ def _handle_resolving_conflict(
     #     would silently revert anything that landed on `origin/<branch>`
     #     out-of-band. Refuse and park.
     ahead, behind = _wf._branch_ahead_behind(spec, wt, branch)
+    publish_lease: Optional[str] = None
     if behind > 0:
         # Normally a behind-the-PR-head worktree is stale or diverged and
         # we refuse to force-push (it could clobber the real PR head). One
@@ -368,10 +379,15 @@ def _handle_resolving_conflict(
                 issue.number, spec.remote_name, spec.base_branch,
                 pr.head.sha[:8],
             )
-            # Fall through to the `ahead > 0` push below: it force-with-
-            # lease pushes (ls-remote lease == the PR head we just measured,
-            # so a concurrent foreign push still rejects) and flips to
-            # `validating`.
+            # Pin the upcoming force-push lease to the exact PR head we
+            # just validated as orchestrator-produced. A bare
+            # `_push_branch` would do a fresh `ls-remote` and lease
+            # against whatever SHA is live at push time -- if a foreign
+            # push lands on the PR branch between `gh.get_pr()` and the
+            # push below, the new SHA would become the lease and the
+            # force-push would silently overwrite it. Leasing against
+            # the validated SHA refuses any such concurrent update.
+            publish_lease = pr.head.sha
         else:
             _wf._park_awaiting_human(
                 gh, issue, state,
@@ -409,7 +425,9 @@ def _handle_resolving_conflict(
             "ahead of %s/%s before attempting base rebase",
             issue.number, ahead, spec.remote_name, branch,
         )
-        if not _wf._push_branch(spec, wt, branch):
+        if not _wf._push_branch(
+            spec, wt, branch, force_with_lease=publish_lease,
+        ):
             _wf._park_awaiting_human(
                 gh, issue, state,
                 f"{config.HITL_MENTIONS} git push of recovered conflict "
@@ -418,23 +436,65 @@ def _handle_resolving_conflict(
             )
             gh.write_pinned_state(issue, state)
             return
-        state.set("review_round", 0)
-        state.set("conflict_round", conflict_round + 1)
-        state.set("last_conflict_resolved_at", _wf._now_iso())
-        _emit_conflict_round_incremented(
-            gh, issue, state,
-            pr_number=int(pr_number),
-            new_round=conflict_round + 1,
-            outcome="recovered_push",
-            sha=_wf._head_sha(wt) or None,
+        # Probe whether the worktree is still behind base after the
+        # push. The recovered-push case was originally written for
+        # crash-recovery where the prior tick had already rebased onto
+        # base before crashing -- HEAD contains base, the follow-up
+        # rebase below would be a no-op, and a direct flip to validating
+        # is correct. But the `fixing` drift router
+        # (`_route_parked_fixing_to_resolving_conflict`) also reroutes
+        # here when a `push_failed` park has UNPUSHED FIX COMMITS on a
+        # stale base: the commits are NOT a rebase, so the push above
+        # leaves the branch still behind base. Marking validating now
+        # would publish a still-behind PR and consume a `conflict_round`
+        # without ever attempting the base rebase the reroute was meant
+        # to perform -- under a low `MAX_CONFLICT_ROUNDS` the real
+        # rebase pass could even be blocked by the cap. When the probe
+        # confirms behind base, fall through to the rebase path; that
+        # path owns the bookkeeping (conflict_round bump, event emit,
+        # label flip) for the combined push+rebase round.
+        base_ref = f"{spec.remote_name}/{spec.base_branch}"
+        behind_base_r = _wf._git(
+            "rev-list", "--count", f"HEAD..{base_ref}", cwd=wt,
         )
-        # Pushed branch diff -> hand straight back to validating; the
-        # single docs pass runs after final reviewer approval.
-        gh.set_workflow_label(issue, WorkflowLabel.VALIDATING)
-        gh.write_pinned_state(issue, state)
-        return
+        if behind_base_r.returncode != 0:
+            # Probe failed (e.g. stale base ref, transient git error).
+            # Don't silently take the fast path: rebase is the safer
+            # default since `_rebase_base_into_worktree` is a no-op
+            # when HEAD already contains base. The rebase path
+            # re-fetches base so a stale local ref self-corrects.
+            still_behind_base = 1
+        else:
+            try:
+                still_behind_base = int(
+                    (behind_base_r.stdout or "0").strip() or "0"
+                )
+            except ValueError:
+                still_behind_base = 1
+        if still_behind_base == 0:
+            state.set("review_round", 0)
+            state.set("conflict_round", conflict_round + 1)
+            state.set("last_conflict_resolved_at", _wf._now_iso())
+            _emit_conflict_round_incremented(
+                gh, issue, state,
+                pr_number=int(pr_number),
+                new_round=conflict_round + 1,
+                outcome="recovered_push",
+                sha=_wf._head_sha(wt) or None,
+            )
+            # Pushed branch diff -> hand straight back to validating; the
+            # single docs pass runs after final reviewer approval.
+            gh.set_workflow_label(issue, WorkflowLabel.VALIDATING)
+            gh.write_pinned_state(issue, state)
+            return
+        _wf.log.info(
+            "issue=#%d resolving_conflict: pushed %d recovered commit(s) "
+            "but worktree still %d behind %s; continuing with base rebase",
+            issue.number, ahead, still_behind_base, base_ref,
+        )
 
-    # In sync. Refresh `<remote>/<base>` so the upcoming
+    # In sync (or fell through after a recovered push to reconcile a
+    # stale base). Refresh `<remote>/<base>` so the upcoming
     # `git rebase <remote>/<base>` sees the current base tip.
     fetch_base = _wf._authed_fetch(
         spec,

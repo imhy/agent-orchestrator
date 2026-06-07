@@ -56,19 +56,27 @@ even though the bookmarks recorded triggering ids) also relabels to
 `validating` directly: there is no fix work to do, so the reviewer
 re-evaluates the existing head.
 
-A park that the rescan finds nothing new for is a dead end when the
-worktree has drifted out of sync with the PR in the meantime: the
-per-tick base sync stands down on every `awaiting_human` park, so the
-integration work nobody else will do is stranded.
-`_route_parked_fixing_to_resolving_conflict` breaks that dead-lock by
-handing the issue to `resolving_conflict` (which owns rebasing AND
-publishing a PR branch) when the clean worktree is either BEHIND
-`<remote>/<base>` (needs a rebase) or already rebased onto base but
-diverged from a stale remote PR head (a rebase a prior run never pushed
--- `_handle_resolving_conflict` recognizes the already-rebased worktree
-and force-publishes it). It no-ops when `hold_base_sync` is set, the
-worktree is missing / dirty, or the worktree is already in sync with the
-PR head (a genuine dev question that keeps waiting for a human).
+A validating-route transient park (`push_failed` / `agent_timeout` /
+`reviewer_timeout` / `reviewer_failed`) whose own recovery returns
+`"stuck"` can still be unstuck when the underlying condition is
+worktree drift: the per-tick base sync stands down on every
+`awaiting_human` park, so a base advance that landed between the prior
+push and this tick leaves the integration work nobody else will do
+stranded. `_route_parked_fixing_to_resolving_conflict` breaks that
+dead-lock by handing the issue to `resolving_conflict` (which owns
+rebasing AND publishing a PR branch) when the clean worktree is either
+BEHIND `<remote>/<base>` (needs a rebase) or already rebased onto base
+but diverged from a stale remote PR head (a rebase a prior run never
+pushed -- `_handle_resolving_conflict` recognizes the already-rebased
+worktree and force-publishes it). The router is deliberately gated on
+the stuck-transient branch: parks shaped like a real agent question or
+a dirty worktree (`park_reason=None`, `agent_silent`, `dirty_worktree`)
+stay parked even when the worktree has drifted, because we cannot
+distinguish a genuine "agent needs input" from a "nothing to fix"
+remark by inspection -- auto-recovering either would silently bypass
+the HITL contract. The router also no-ops when `hold_base_sync` is set,
+the worktree is missing / dirty, or the worktree is already in sync
+with the PR head.
 
 PR-state terminals (merged / closed-without-merge / open-PR-with-closed-issue)
 mirror the in_review arcs so an external manual merge or rejection while
@@ -292,7 +300,21 @@ def _handle_fixing(gh: GitHubClient, spec: RepoSpec, issue: Issue) -> None:
                 spec, issue, state,
             )
             if recovery == "stuck":
-                return  # still stuck; do not re-post the park comment
+                # The transient condition has not resolved on its own
+                # (e.g. `push_failed` keeps failing). When the worktree
+                # has drifted from the PR head in the meantime, hand the
+                # reconciliation to `resolving_conflict` rather than sit
+                # parked forever -- the per-tick base sync deliberately
+                # stands down on every `awaiting_human` park, so nobody
+                # else will sync this worktree. Limiting the drift route
+                # to this branch keeps the HITL contract intact: question
+                # / dirty / silent / in_review-route transient parks fall
+                # through to the bare `return` below and keep waiting for
+                # a human comment.
+                _route_parked_fixing_to_resolving_conflict(
+                    gh, spec, issue, state, pr,
+                )
+                return
             # Conditions resolved (either no fix landed or a deferred
             # push finished). Clear the park flags and flip back to
             # `validating` so the reviewer re-evaluates the current head
@@ -310,14 +332,14 @@ def _handle_fixing(gh: GitHubClient, spec: RepoSpec, issue: Issue) -> None:
             gh.write_pinned_state(issue, state)
             return
         if not new_feedback:
-            # Dead-lock breaker: this park has nothing left for the dev
-            # to do, but the worktree may be out of sync with the PR. The
-            # per-tick base sync stands down on every awaiting_human park,
-            # so hand the reconciliation to `resolving_conflict` (which
-            # owns rebasing AND publishing a PR branch) rather than sitting
-            # parked forever. No drift -> the router leaves the park intact
-            # and the issue keeps waiting for a human.
-            _route_parked_fixing_to_resolving_conflict(gh, spec, issue, state, pr)
+            # All other awaiting_human shapes (question parks, dirty
+            # worktree parks, silent-crash parks, in_review-route
+            # transients) stay parked until a fresh human reply lands.
+            # We cannot distinguish "agent has a real question" from
+            # "agent reported nothing to change" by inspection -- both
+            # surface through `_on_question` with `park_reason=None` --
+            # so auto-routing either would silently bypass the HITL
+            # contract.
             return
         state.set("awaiting_human", False)
         state.set("park_reason", None)
@@ -463,15 +485,19 @@ def _handle_fixing(gh: GitHubClient, spec: RepoSpec, issue: Issue) -> None:
 def _route_parked_fixing_to_resolving_conflict(
     gh: GitHubClient, spec: RepoSpec, issue: Issue, state, pr,
 ) -> bool:
-    """Hand a dead-locked `fixing` park to `resolving_conflict` on worktree drift.
+    """Hand a stuck validating-route transient `fixing` park to
+    `resolving_conflict` on worktree drift.
 
-    A `fixing` round that parks `awaiting_human` with no commit (the dev
-    reported nothing to fix) is a dead end when the worktree no longer
-    matches the PR: the per-tick base sync (`_sync_pr_worktree_to_base`)
+    Called from the `recovery == "stuck"` branch of `_handle_fixing`:
+    `_try_recover_validating_transient_park` could not clear the
+    transient condition (e.g. `push_failed` keeps failing), but the
+    underlying cause may be a base advance that landed while the issue
+    was parked. The per-tick base sync (`_sync_pr_worktree_to_base`)
     deliberately stands down on every `awaiting_human` park, so the
     integration work nobody else will do is stranded and the issue sits
-    parked forever. Two shapes both reconcile via `resolving_conflict`,
-    which owns rebasing AND publishing a PR branch:
+    parked forever. Two drift shapes both reconcile via
+    `resolving_conflict`, which owns rebasing AND publishing a PR
+    branch:
 
       * worktree BEHIND `<remote>/<base>` -> needs a rebase.
       * worktree already rebased locally but the rewrite was never pushed,
@@ -488,8 +514,8 @@ def _route_parked_fixing_to_resolving_conflict(
     Returns False (issue stays parked) when the worktree is missing,
     dirty (an operator may be inspecting a dirty-tree park), the issue
     carries `hold_base_sync` (an explicit operator pause on base
-    integration), or the worktree is already in sync with the PR head (a
-    genuine dev question must keep waiting for the human).
+    integration), or the worktree is already in sync with the PR head
+    (the transient condition is the real blocker, not drift).
 
     The `pending_fix_*` bookmarks and in_review watermarks are left
     untouched so the eventual `in_review` re-entry still re-discovers the
@@ -550,8 +576,8 @@ def _route_parked_fixing_to_resolving_conflict(
         _wf._post_pr_comment(
             gh, pr_number, state,
             f":mag: PR worktree is out of sync ({reason}) and the `fixing` "
-            "fix-loop is parked with no pending feedback to apply (the dev "
-            "reported nothing to change). Routing `fixing` -> "
+            "fix-loop is parked on a stuck transient condition that the "
+            "self-recovery could not clear. Routing `fixing` -> "
             "`resolving_conflict` to reconcile the branch before the next "
             "reviewer round.",
         )

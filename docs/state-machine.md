@@ -277,15 +277,14 @@ The docs pass is deliberately a thin dev-session rerun on the existing PR worktr
   3. Open issue with no `pr_number` (manual relabel) → park (`missing_pr_number`).
   4. Rescan unread feedback from the three watermarks across all four surfaces. Orchestrator comments are filtered by recorded id AND the hidden `<!--orchestrator-comment-->` body marker.
   5. If `awaiting_human` and the rescan finds nothing new, branch on `park_reason` AND the route discriminator `pending_fix_at`:
-     - **Transient reason** (`push_failed` / `agent_timeout` / `reviewer_timeout` / `reviewer_failed` — the `_VALIDATING_TRANSIENT_PARK_REASONS` set) **and `pending_fix_at` unset (validating route)** → call `_try_recover_validating_transient_park`. On `cleared` or `pushed`, clear park, clear `pending_fix_*`, flip back to `validating` (the helper bumps `review_round` on `pushed`). This closes the loop for `_handle_validating`'s CHANGES_REQUESTED route.
-     - **Transient reason BUT `pending_fix_at` is set (in_review route)** → fall through to the worktree-drift check below, then return.
-     - **Non-transient reason** → fall through to the worktree-drift check below, then return.
+     - **Transient reason** (`push_failed` / `agent_timeout` / `reviewer_timeout` / `reviewer_failed` — the `_VALIDATING_TRANSIENT_PARK_REASONS` set) **and `pending_fix_at` unset (validating route)** → call `_try_recover_validating_transient_park`. On `cleared` or `pushed`, clear park, clear `pending_fix_*`, flip back to `validating` (the helper bumps `review_round` on `pushed`). This closes the loop for `_handle_validating`'s CHANGES_REQUESTED route. On `stuck`, fall through to the worktree-drift check below.
+     - **Any other awaiting-human shape** (transient reason on the in_review route, non-transient reason like a real agent question, dirty-worktree park, or silent-crash park) → return silently and keep waiting for a human reply. We cannot distinguish "agent has a real question" from "agent reported nothing to change" by inspection (both surface through `_on_question` with `park_reason=None`), so auto-routing either would silently bypass the HITL contract.
 
-     **Worktree-drift dead-lock breaker** (`_route_parked_fixing_to_resolving_conflict`). Both "return silently" cases above first run this check: a no-progress fix park (the dev had nothing to commit) is a dead end when the worktree no longer matches the PR, because the per-tick base sync stands down on every `awaiting_human` park (`_sync_pr_worktree_to_base` returns at its `awaiting_human` gate). On a clean worktree (not held by `hold_base_sync`) the breaker routes to `resolving_conflict` — seeding `conflict_round` when absent, clearing the park, posting a PR notice, emitting `conflict_round` `action="entered"` (`stage="fixing"`) — in either of two shapes, both reconciled by the conflict handler, which owns rebasing AND publishing a PR branch:
+     **Worktree-drift dead-lock breaker** (`_route_parked_fixing_to_resolving_conflict`). Reached only from the stuck-validating-route-transient branch above: the self-recovery could not clear the condition, and the underlying cause may be a base advance that landed mid-park (the per-tick base sync deliberately stands down on every `awaiting_human` park — `_sync_pr_worktree_to_base` returns at its `awaiting_human` gate — so nobody else will sync this worktree). On a clean worktree (not held by `hold_base_sync`) the breaker routes to `resolving_conflict` — seeding `conflict_round` when absent, clearing the park, posting a PR notice, emitting `conflict_round` `action="entered"` (`stage="fixing"`) — in either of two shapes, both reconciled by the conflict handler, which owns rebasing AND publishing a PR branch:
        - **behind `<remote>/<base>`** (a local `rev-list HEAD..<remote>/<base>`) → needs a rebase;
        - **already on base but local HEAD ≠ the live `pr.head.sha`** (a rebase a prior run ran but never pushed) → needs a force-publish (see `_handle_resolving_conflict` below).
 
-     The routing decision is cheap — no extra fetch, since `pr` was already fetched this tick. With no drift (the worktree is in sync with the PR head), or a dirty / held worktree, the park is left intact and the issue keeps awaiting a human. The `pending_fix_*` bookmarks and in_review watermarks are left untouched so the eventual in_review re-entry still re-discovers the feedback. The `_AUTO_REBASE_PARK_REASONS` parks are excluded (they return earlier — the operator's comment is base sync's own retry signal), as is the validating-route transient `stuck` outcome (its CHANGES_REQUESTED fix is still unfinished, so the dev, not a rebase, owes the next move).
+     The routing decision is cheap — no extra fetch, since `pr` was already fetched this tick. With no drift (the worktree is in sync with the PR head), or a dirty / held worktree, the park is left intact and the issue keeps awaiting a human. The `pending_fix_*` bookmarks and in_review watermarks are left untouched so the eventual in_review re-entry still re-discovers the feedback.
   6. If no unread feedback at all (watermarks already cover the bookmarks), clear `pending_fix_*` and bounce back to `validating`.
   7. **Quiet window**: compute the newest `created_at` (or `submitted_at` for review summaries); if younger than `IN_REVIEW_DEBOUNCE_SECONDS`, return.
   8. **Resume**: build a `_build_pr_comment_followup` prompt over ALL unread surfaces, resume the locked dev via `_resume_dev_with_text`, refresh `user_content_hash` (so any issue-thread comment we just fed to the dev doesn't re-fire validating's drift check). Apply the same `_handle_dev_fix_result` disposition as the validating fix-loop.
@@ -294,7 +293,7 @@ The docs pass is deliberately a thin dev-session rerun on the existing PR worktr
 - **Output**: terminal `done` / `rejected`, OR label flipped to `validating` (pushed fix OR no-new-feedback bounce), OR label flipped to `resolving_conflict` (parked-with-nothing-new while the worktree is out of sync with the PR — behind base or an unpushed local rebase), OR a HITL park, OR a no-op (quiet-window wait, missing-PR park already set).
 
 ### `_handle_resolving_conflict` (label `resolving_conflict`)
-- **Trigger**: each tick while label is `resolving_conflict` (set by an operator relabel, by `_refresh_base_and_worktrees` when the auto rebase actually left conflicted files — a merely-behind-base PR rebase + push lands directly on `validating` — or by `_handle_fixing`'s worktree-drift dead-lock breaker when a parked-with-nothing-new fixing issue is found out of sync with the PR head). Also runs on closed-`resolving_conflict` issues for terminal handling.
+- **Trigger**: each tick while label is `resolving_conflict` (set by an operator relabel, by `_refresh_base_and_worktrees` when the auto rebase actually left conflicted files — a merely-behind-base PR rebase + push lands directly on `validating` — or by `_handle_fixing`'s worktree-drift dead-lock breaker when a validating-route transient `fixing` park whose self-recovery returned `"stuck"` is found out of sync with the PR head). Also runs on closed-`resolving_conflict` issues for terminal handling.
 - **Input**: pinned `pr_number`, `branch`, `dev_agent` / `dev_session_id`, `conflict_round`. `MAX_CONFLICT_ROUNDS` from config.
 - **Internal flow**:
   1. If `pr_number` is missing → park.
@@ -305,7 +304,7 @@ The docs pass is deliberately a thin dev-session rerun on the existing PR worktr
   6. Ensure the PR worktree via `_ensure_pr_worktree` (restores from `<remote>/<branch>`, NOT base — `_ensure_worktree` would discard the PR's commits).
   7. Refresh `<remote>/<branch>` over `_authed_fetch` so a stale local ref doesn't mis-classify a "remote moved" situation as in-sync.
   8. Compare HEAD to the freshly-fetched `<remote>/<branch>`:
-     - `behind > 0` (worktree diverged) → normally park (`diverged_branch`) since force-pushing could clobber the real PR head. **Exception — already-rebased-but-unpushed:** when the worktree is also `ahead > 0` AND already sits on top of base (`_already_rebased_onto_base` re-fetches base and checks `HEAD..<remote>/<base>` is empty) AND the stale remote head is one the orchestrator itself produced (`_pr_head_orchestrator_produced`: `pr.head.sha ∈ {docs_checked_sha, agent_approved_sha}`), the "behind" commits are the orchestrator's own superseded pre-rebase commits — there is nothing external to lose, so fall through to the `ahead > 0` push and force-publish instead of parking. This is the case the fixing worktree-drift breaker hands here. If either guard fails (not on base, or an unrecognized head that might carry a direct push), keep the `diverged_branch` park.
+     - `behind > 0` (worktree diverged) → normally park (`diverged_branch`) since force-pushing could clobber the real PR head. **Exception — already-rebased-but-unpushed:** when the worktree is also `ahead > 0` AND already sits on top of base (`_already_rebased_onto_base` re-fetches base and checks `HEAD..<remote>/<base>` is empty) AND the stale remote head is one the orchestrator itself produced (`_pr_head_orchestrator_produced`: `pr.head.sha == docs_checked_sha` — the only key production code persists for an orchestrator-pushed head, written by `_handle_documenting`'s success exits), the "behind" commits are the orchestrator's own superseded pre-rebase commits — there is nothing external to lose, so fall through to the `ahead > 0` push and force-publish instead of parking. PR heads from earlier in the lifecycle (the initial implementing push, an intermediate fixing push) are not currently recorded anywhere in pinned state, so the exception declines those by design. If either guard fails (not on base, or an unrecognized head that might carry a direct push), keep the `diverged_branch` park.
      - `ahead > 0` (recovered unpushed commits, or the already-rebased fall-through above) → dirty-tree check, then push the recovered work (force-with-lease against the live remote head) and flip to `validating` with `review_round=0`, `conflict_round += 1`.
      - `(0, 0)` → fall through.
   9. Refresh `<remote>/<base>` and run `git rebase <remote>/<base>` under `_git_hardened` (drops global / system config, disables hooks / fsmonitor / credential helpers / commit signing / autostash — the agent owns the worktree and could otherwise plant a hook to execute attacker code mid-rebase).
@@ -391,17 +390,21 @@ The Q&A flow keeps state minimal: no PR is ever opened, no branch is ever pushed
      pr merged externally / closed unmerged ─► done / rejected
      Otherwise rescan the three in_review watermarks across all four
      surfaces; if awaiting_human with no new feedback, branch on
-     park_reason + pending_fix_at, then (for the silent-return cases)
-     route to resolving_conflict when the clean, unheld worktree is out
-     of sync with the PR -- behind base, OR already on base but local
-     HEAD != the live pr.head.sha (an unpushed local rebase) -- the
-     dead-lock breaker base sync can't reach while
-     parked; if no unread feedback at all, clear
-     pending_fix_* and bounce to validating; otherwise honour
-     IN_REVIEW_DEBOUNCE_SECONDS. Past the window, resume the dev with
-     a `_build_pr_comment_followup` prompt and apply the validating
-     fix-loop disposition. Watermarks advance ONLY to the max id fed
-     to the dev. On a pushed fix, adjust review_round per
+     park_reason + pending_fix_at. For a stuck validating-route
+     transient park (`_VALIDATING_TRANSIENT_PARK_REASONS` with
+     pending_fix_at unset, _try_recover_validating_transient_park
+     returns "stuck"), route to resolving_conflict when the clean,
+     unheld worktree is out of sync with the PR -- behind base, OR
+     already on base but local HEAD != the live pr.head.sha (an
+     unpushed local rebase) -- the dead-lock breaker base sync can't
+     reach while parked. Every other awaiting-human shape (real agent
+     question / dirty park / silent-crash / in_review-route transient)
+     stays parked silently to preserve HITL. If no unread feedback at
+     all, clear pending_fix_* and bounce to validating; otherwise
+     honour IN_REVIEW_DEBOUNCE_SECONDS. Past the window, resume the
+     dev with a `_build_pr_comment_followup` prompt and apply the
+     validating fix-loop disposition. Watermarks advance ONLY to the
+     max id fed to the dev. On a pushed fix, adjust review_round per
      pending_fix_at (in_review->fixing reset to 0; validating->fixing
      bump by 1) and flip directly to validating. Docs do not run on
      this exit.

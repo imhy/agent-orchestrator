@@ -1545,8 +1545,18 @@ class HandleResolvingConflictTest(
 
         from unittest.mock import MagicMock
         merge_mock = MagicMock(return_value=(True, []))
+        # After the recovered push the handler probes whether the
+        # worktree is still behind base via `git rev-list --count
+        # HEAD..origin/<base>`. The crash-recovery scenario this test
+        # exercises has HEAD already on base, so the probe returns 0
+        # and the handler takes the fast path to validating without a
+        # follow-up rebase.
+        git_on_base = MagicMock(
+            return_value=MagicMock(returncode=0, stdout="0\n", stderr=""),
+        )
 
-        with patch.object(workflow, "_rebase_base_into_worktree", merge_mock):
+        with patch.object(workflow, "_rebase_base_into_worktree", merge_mock), \
+             patch.object(workflow, "_git", git_on_base):
             mocks = self._run(
                 lambda: workflow._handle_resolving_conflict(
                     gh, _TEST_SPEC, issue,
@@ -1716,6 +1726,75 @@ class HandleResolvingConflictTest(
         data = gh.pinned_data(200)
         self.assertTrue(data.get("awaiting_human"))
 
+    def test_recovered_push_with_stale_base_falls_through_to_rebase(self) -> None:
+        # The `fixing` drift router
+        # (`_route_parked_fixing_to_resolving_conflict`) reroutes here
+        # when a stuck `push_failed` / `agent_timeout` park has
+        # UNPUSHED FIX COMMITS on a base that has since advanced. The
+        # recovered-push fast path would publish the fix to the PR
+        # branch and flip straight to `validating` -- but the branch
+        # is still behind base. Probe behind-base after the push and
+        # fall through to the rebase path so the same tick integrates
+        # base and consumes exactly ONE `conflict_round` for the
+        # combined push+rebase reconciliation. Without this, the PR
+        # would be republished still-behind-base and the round counter
+        # would burn a slot toward `MAX_CONFLICT_ROUNDS` without ever
+        # attempting the base rebase the reroute was meant to perform.
+        gh, issue, pr = self._seed()
+
+        from unittest.mock import MagicMock
+        # Clean rebase that actually moved HEAD (recovered push +
+        # rebase pushes a different SHA than the recovered SHA).
+        merge_mock = MagicMock(return_value=(True, []))
+        # Probe says still 2 commits behind base after the recovered
+        # push, forcing the fall-through.
+        git_behind_base = MagicMock(
+            return_value=MagicMock(returncode=0, stdout="2\n", stderr=""),
+        )
+
+        with patch.object(workflow, "_rebase_base_into_worktree", merge_mock), \
+             patch.object(workflow, "_git", git_behind_base):
+            mocks = self._run(
+                lambda: workflow._handle_resolving_conflict(
+                    gh, _TEST_SPEC, issue,
+                ),
+                run_agent=_agent(),
+                push_branch=True,
+                # Recovered push first (force-with-lease=None on a
+                # straight-ahead push), then the rebased-head push
+                # (force-with-lease=before_sha). The handler also reads
+                # HEAD for the round-emit on success, so feed enough
+                # SHAs through `_head_sha` for both the rebase-path's
+                # before/after compare and the audit emit.
+                branch_ahead_behind=(1, 0),
+                head_shas=["before", "after", "after"],
+            )
+
+        # Both the recovered push AND the rebased-head push fired this
+        # tick; the merge attempt ran in between.
+        self.assertEqual(mocks["_push_branch"].call_count, 2)
+        merge_mock.assert_called_once()
+        # No agent spawn -- the rebase was clean.
+        mocks["run_agent"].assert_not_called()
+        # Single conflict_round increment for the combined push+rebase
+        # reconciliation, NOT one per push.
+        data = gh.pinned_data(200)
+        self.assertEqual(data.get("conflict_round"), 1)
+        self.assertEqual(data.get("review_round"), 0)
+        self.assertIn("last_conflict_resolved_at", data)
+        # The combined round outcome is the rebase path's
+        # `base_rebased_clean`, not the fast-path `recovered_push`.
+        rounds = [
+            e for e in gh.recorded_events
+            if e.get("event") == "conflict_round"
+            and e.get("action") == "incremented"
+        ]
+        self.assertEqual(len(rounds), 1)
+        self.assertEqual(rounds[0].get("outcome"), "base_rebased_clean")
+        # Hand back to validating after the rebase landed.
+        self.assertIn((200, "validating"), gh.label_history)
+        self.assertNotIn((200, "documenting"), gh.label_history)
+
 
 class HandleResolvingConflictHashDriftTest(
     unittest.TestCase, _PatchedWorkflowMixin,
@@ -1797,7 +1876,10 @@ class ResolvingConflictPublishesAlreadyRebasedTest(
             310, pr_number=self.PR_NUMBER, branch=self.BRANCH,
             dev_agent="claude", dev_session_id="dev-sess",
             review_round=2, conflict_round=0,
-            docs_checked_sha=self.PR_HEAD, agent_approved_sha=self.PR_HEAD,
+            # `_handle_documenting`'s success exits are the one place
+            # production code records the orchestrator's pushed head, so
+            # the force-publish guard recognises this state.
+            docs_checked_sha=self.PR_HEAD,
         )
         return gh, issue, pr
 
@@ -1805,13 +1887,20 @@ class ResolvingConflictPublishesAlreadyRebasedTest(
         # The worktree is 4 ahead / 2 behind the remote PR head (a rebase
         # rewrote history). Patch the two safety probes directly so the
         # handler's publish-vs-park branch is exercised in isolation.
+        # After a successful force-publish the handler probes
+        # `rev-list HEAD..origin/<base>` to decide between the fast
+        # path and a follow-up rebase; this scenario is "already on
+        # base", so the probe returns 0 and the fast path fires.
+        git_on_base = MagicMock(
+            return_value=MagicMock(returncode=0, stdout="0\n", stderr=""),
+        )
         with patch.object(
             conflicts, "_already_rebased_onto_base",
             MagicMock(return_value=on_base),
         ), patch.object(
             conflicts, "_pr_head_orchestrator_produced",
             MagicMock(return_value=recognized),
-        ):
+        ), patch.object(workflow, "_git", git_on_base):
             return self._run(
                 lambda: workflow._handle_resolving_conflict(
                     gh, _TEST_SPEC, issue,
@@ -1824,7 +1913,7 @@ class ResolvingConflictPublishesAlreadyRebasedTest(
 
     def test_publishes_when_on_base_and_recognized(self) -> None:
         gh, issue, _ = self._seed()
-        self._run_diverged(gh, issue, on_base=True, recognized=True)
+        mocks = self._run_diverged(gh, issue, on_base=True, recognized=True)
         # Force-published over the stale PR head -> validating, no park.
         self.assertIn((310, "validating"), gh.label_history)
         data = gh.pinned_data(310)
@@ -1838,6 +1927,15 @@ class ResolvingConflictPublishesAlreadyRebasedTest(
         ]
         self.assertEqual(len(rounds), 1)
         self.assertEqual(rounds[0].get("outcome"), "recovered_push")
+        # The push must be leased to the EXACT PR head we validated as
+        # orchestrator-produced. A bare `_push_branch(spec, wt, branch)`
+        # would do a fresh `ls-remote` and lease against whatever SHA
+        # is live at push time, silently clobbering any foreign push
+        # that landed between `gh.get_pr()` and this push.
+        mocks["_push_branch"].assert_called_once_with(
+            _TEST_SPEC, _FAKE_WT, self.BRANCH,
+            force_with_lease=self.PR_HEAD,
+        )
 
     def _assert_diverged_park(self, gh) -> None:
         # `_park_awaiting_human` records the reason on the audit event;
@@ -1869,19 +1967,22 @@ class ResolvingConflictPublishGuardUnitTest(unittest.TestCase):
     def _pr(self, sha):
         return FakePR(number=1, head_branch="b", head=FakePRRef(sha=sha))
 
-    def test_pr_head_orchestrator_produced_recognizes_recorded_heads(
+    def test_pr_head_orchestrator_produced_recognizes_docs_checked_sha(
         self,
     ) -> None:
+        # `docs_checked_sha` is the only key production code persists for
+        # an orchestrator-produced PR head (set by `_handle_documenting`'s
+        # success exits). PR heads from earlier in the lifecycle (the
+        # initial implementing push, an intermediate fixing push) are not
+        # currently recorded, so the guard refuses those by design rather
+        # than guessing.
         gh = FakeGitHubClient()
         issue = make_issue(1, label="resolving_conflict")
         gh.add_issue(issue)
-        gh.seed_state(1, docs_checked_sha="abc", agent_approved_sha="def")
+        gh.seed_state(1, docs_checked_sha="abc")
         st = gh.read_pinned_state(issue)
         self.assertTrue(
             conflicts._pr_head_orchestrator_produced(st, self._pr("abc")),
-        )
-        self.assertTrue(
-            conflicts._pr_head_orchestrator_produced(st, self._pr("def")),
         )
         self.assertFalse(
             conflicts._pr_head_orchestrator_produced(st, self._pr("xyz")),
@@ -1889,6 +1990,16 @@ class ResolvingConflictPublishGuardUnitTest(unittest.TestCase):
         # An empty/missing head never matches.
         self.assertFalse(
             conflicts._pr_head_orchestrator_produced(st, self._pr("")),
+        )
+        # No `docs_checked_sha` recorded -- e.g. a pre-docs validating
+        # PR head -- must NOT match an empty-string lookup either.
+        gh2 = FakeGitHubClient()
+        issue2 = make_issue(2, label="resolving_conflict")
+        gh2.add_issue(issue2)
+        gh2.seed_state(2, dev_agent="claude")
+        st2 = gh2.read_pinned_state(issue2)
+        self.assertFalse(
+            conflicts._pr_head_orchestrator_produced(st2, self._pr("abc")),
         )
 
     def test_already_rebased_onto_base_reads_rev_list_count(self) -> None:
@@ -1909,6 +2020,30 @@ class ResolvingConflictPublishGuardUnitTest(unittest.TestCase):
             self.assertFalse(
                 conflicts._already_rebased_onto_base(_TEST_SPEC, Path("/tmp/x")),
             )
+
+    def test_already_rebased_onto_base_fails_closed_on_fetch_failure(
+        self,
+    ) -> None:
+        # Without proving HEAD is on the CURRENT base tip, we cannot
+        # let the force-publish path enable. A stale
+        # `<remote>/<base>` ref would let `rev-list HEAD..<remote>/<base>`
+        # report "no missing commits" purely because the local mirror is
+        # behind the real base -- mis-classifying a behind-base worktree
+        # as already-rebased and force-publishing it.
+        fetch_fail = MagicMock(
+            return_value=MagicMock(returncode=1, stdout="", stderr="boom"),
+        )
+        rev_list_zero = MagicMock(
+            return_value=MagicMock(returncode=0, stdout="0\n"),
+        )
+        with patch.object(workflow, "_authed_fetch", fetch_fail), \
+             patch.object(workflow, "_git_hardened", rev_list_zero):
+            self.assertFalse(
+                conflicts._already_rebased_onto_base(_TEST_SPEC, Path("/tmp/x")),
+            )
+        # And the rev-list probe must be skipped entirely on fetch failure
+        # -- there is no value reading a count off a stale ref.
+        rev_list_zero.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -99,7 +99,7 @@ The dispatch loop classifies each issue as family-aware (`decomposing` / `blocke
 
 Per-issue durable state lives in a single **pinned comment** on the issue (`<!--orchestrator-state {...json...}-->`). The orchestrator process is stateless; the label and the pinned JSON are the entire dispatch input.
 
-For the full per-tick sequence (eligible-issue enumeration, family vs. fan-out partitioning, the pre-PR rebase / PR-having clean-rebase + push (with `resolving_conflict` reserved for actual rebase conflicts), the `hold_base_sync` / `question` skips, the per-tick external-merge sweeps, and the complete pinned-state JSON schema), see [`state-machine.md#per-tick-flow-workflowtick`](state-machine.md#per-tick-flow-workflowtick).
+For the full per-tick sequence (eligible-issue enumeration, family vs. fan-out partitioning, the pre-PR rebase / PR-having clean-rebase + push (with `resolving_conflict` reached on actual rebase conflicts, plus the `fixing` worktree-drift dead-lock breaker that hands a stuck validating-route transient fix-loop to `resolving_conflict` when the worktree is behind base or carries an unpushed rebase), the `hold_base_sync` / `question` skips, the per-tick external-merge sweeps, and the complete pinned-state JSON schema), see [`state-machine.md#per-tick-flow-workflowtick`](state-machine.md#per-tick-flow-workflowtick).
 
 ## Stage handlers
 
@@ -153,13 +153,13 @@ For the per-sink schema, event-kind tables, append / retention / rotation semant
 |---|---|---|---|
 | `main` polling loop | long-lived Python process | manual start (or wrapper) | every `POLL_INTERVAL`s |
 | `workflow.tick(gh, spec)` | function call | each loop iteration | once per tick per configured `RepoSpec`; multi-repo fans out across a `ThreadPoolExecutor`, single-repo stays in-thread |
-| `_refresh_base_and_worktrees(gh, spec)` | function call | start of each `workflow.tick` | once per tick per repo: one `git fetch <spec.remote_name> <spec.base_branch>`, then per-worktree dispatch (pre-PR worktrees rebase directly; PR-having worktrees behind base are rebased + pushed in the refresh itself via `_sync_pr_worktree_to_base` and routed to `validating` on success, with `resolving_conflict` reserved for actual rebase conflicts) |
+| `_refresh_base_and_worktrees(gh, spec)` | function call | start of each `workflow.tick` | once per tick per repo: one `git fetch <spec.remote_name> <spec.base_branch>`, then per-worktree dispatch (pre-PR worktrees rebase directly; PR-having worktrees behind base are rebased + pushed in the refresh itself via `_sync_pr_worktree_to_base` and routed to `validating` on success, with `resolving_conflict` reached when the auto rebase actually leaves conflicted files) |
 | `_handle_*` per issue | function call | issue's workflow label | once per tick per open issue; concurrent up to `spec.parallel_limit` per repo and `MAX_PARALLEL_ISSUES_GLOBAL` across all repos. No-agent family buckets (`blocked` / `umbrella`) are cap-exempt |
 | decomposer agent (`DECOMPOSE_AGENT`) | subprocess (fresh or resumed) | `_handle_decomposing` (retry budget OK) or HITL resume | one shot per tick when needed |
 | implementer agent (`DEV_AGENT`) | subprocess | `_handle_implementing` (no commits yet, retry budget OK) or HITL resume | one shot per tick when needed |
 | reviewer agent (`REVIEW_AGENT`) | subprocess (fresh session) | `_handle_validating`, round < max | one shot per tick |
 | dev-fix agent | subprocess (resumed dev session) | reviewer says CHANGES_REQUESTED (dispatched from `_handle_validating` after the relabel to `fixing`), or fresh in_review PR feedback (dispatched from `_handle_fixing` after the quiet window) — both run with `stage="fixing"` and bounce back to `validating` for re-review | one shot per tick |
-| `_handle_resolving_conflict` | function call | issue label `resolving_conflict` (operator relabel or refresh-time conflicted rebase); also fires on closed-`resolving_conflict` issues from the polling sweep | once per tick per such issue |
+| `_handle_resolving_conflict` | function call | issue label `resolving_conflict` (operator relabel, refresh-time conflicted rebase, or the `fixing` worktree-drift dead-lock breaker when a stuck validating-route transient fix-loop is out of sync with the PR head — behind base or an unpushed local rebase); also fires on closed-`resolving_conflict` issues from the polling sweep | once per tick per such issue |
 | dev-conflict agent | subprocess (resumed dev session) | `_handle_resolving_conflict` and `git rebase` left conflicts | one shot per tick |
 | `_handle_question` | function call | issue label `question` OR closed-`question` issue from the polling sweep | once per tick per such issue |
 | question agent (`DECOMPOSE_AGENT` backend) | subprocess (read-only) | `_handle_question` (no prior session OR new human comment on a parked Q&A) | one shot per tick when needed |

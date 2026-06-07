@@ -412,15 +412,15 @@ class FixingConflictDetourTest(unittest.TestCase):
 
 
 class FixingWorktreeDriftRoutingTest(unittest.TestCase):
-    """A `fixing` issue parked awaiting human with no pending feedback is a
-    dead-lock when the worktree has drifted out of sync with the PR: the
-    per-tick base sync stands down on every `awaiting_human` park, so the
-    integration work nobody else will do is stranded and the issue sits
-    parked forever. `_route_parked_fixing_to_resolving_conflict` must hand
-    BOTH shapes -- worktree behind base, and worktree already rebased but
-    its rewrite never pushed (local HEAD != stale PR head) -- to
-    `resolving_conflict`, while leaving a genuinely-stuck park (in sync
-    with the PR, a dirty worktree, or `hold_base_sync`) for the human.
+    """A stuck validating-route transient can route through conflict handling.
+
+    When a validating-route transient park (e.g. `push_failed`) cannot
+    clear via the self-recovery (`_try_recover_validating_transient_park`
+    returns "stuck"), `_handle_fixing` falls through to
+    `_route_parked_fixing_to_resolving_conflict` so a base advance that
+    landed mid-park can still unstick the issue. The router must hand
+    both drift shapes to `resolving_conflict` while leaving any park that
+    could be hiding a real dev question parked for the human.
     """
 
     PR_HEAD = "prhead00cafe1234"
@@ -439,7 +439,13 @@ class FixingWorktreeDriftRoutingTest(unittest.TestCase):
         )
 
     def _seed_parked_fixing(
-        self, gh: FakeGitHubClient, number: int, *, extra_labels=()
+        self,
+        gh: FakeGitHubClient,
+        number: int,
+        *,
+        extra_labels=(),
+        park_reason: str | None = "push_failed",
+        pending_fix_at: str | None = None,
     ) -> None:
         issue = make_issue(number, label="fixing")
         for name in extra_labels:
@@ -459,12 +465,12 @@ class FixingWorktreeDriftRoutingTest(unittest.TestCase):
             dev_agent="claude",
             dev_session_id="dev-sess",
             awaiting_human=True,
-            # A no-commit fix round parks via `_on_question`, which clears
-            # `park_reason` to None -- exactly the dead-locked shape.
-            park_reason=None,
-            # in_review-route discriminator + bookmarks that must survive.
-            pending_fix_at="2026-05-23T00:00:00+00:00",
-            pending_fix_issue_max_id=2000,
+            # Default: a stuck validating-route transient (`push_failed`)
+            # with no `pending_fix_at` so the validating-route recovery
+            # branch fires. Per-test overrides exercise the other shapes
+            # the router must refuse to auto-recover.
+            park_reason=park_reason,
+            pending_fix_at=pending_fix_at,
             # Watermarks above any seeded comment so the rescan finds nothing.
             pr_last_comment_id=5000,
             pr_last_review_comment_id=0,
@@ -472,9 +478,17 @@ class FixingWorktreeDriftRoutingTest(unittest.TestCase):
             review_round=1,
         )
 
-    def _drift_patches(self, behind: int, *, dirty=(), local_head=PR_HEAD):
+    def _drift_patches(
+        self,
+        behind: int,
+        *,
+        dirty=(),
+        local_head=PR_HEAD,
+        recovery: str = "stuck",
+    ):
         wt_path = Path(self._wt_dir)
         self.post = MagicMock()
+        self.recover = MagicMock(return_value=recovery)
         return (
             patch.object(
                 workflow, "_worktree_path", MagicMock(return_value=wt_path),
@@ -488,6 +502,10 @@ class FixingWorktreeDriftRoutingTest(unittest.TestCase):
                 workflow, "_head_sha", MagicMock(return_value=local_head),
             ),
             patch.object(workflow, "_post_pr_comment", self.post),
+            patch.object(
+                workflow, "_try_recover_validating_transient_park",
+                self.recover,
+            ),
         )
 
     def _assert_routed(self, gh, number) -> None:
@@ -495,12 +513,8 @@ class FixingWorktreeDriftRoutingTest(unittest.TestCase):
         data = gh.pinned_data(number)
         self.assertFalse(data.get("awaiting_human"))
         self.assertEqual(data.get("conflict_round"), 0)
-        # Pending-fix bookmarks + in_review watermark survive so the
-        # eventual in_review re-entry re-discovers the feedback.
-        self.assertEqual(
-            data.get("pending_fix_at"), "2026-05-23T00:00:00+00:00",
-        )
-        self.assertEqual(data.get("pending_fix_issue_max_id"), 2000)
+        # The in_review watermark survives so the eventual in_review
+        # re-entry can still re-discover any feedback past it.
         self.assertEqual(data.get("pr_last_comment_id"), 5000)
         self.post.assert_called_once()
         entered = [
@@ -512,66 +526,113 @@ class FixingWorktreeDriftRoutingTest(unittest.TestCase):
         self.assertEqual(len(entered), 1)
         self.assertEqual(entered[0].get("stage"), "fixing")
 
-    def test_behind_base_routes_to_resolving_conflict(self) -> None:
-        # Variant 1: worktree behind base -> resolving_conflict rebases.
+    def test_stuck_push_failed_behind_base_routes(self) -> None:
+        # Variant 1: stuck `push_failed` + worktree behind base ->
+        # resolving_conflict rebases.
         gh = FakeGitHubClient()
         self._seed_parked_fixing(gh, 30)
-        p1, p2, p3, p4, p5 = self._drift_patches(2)
-        with p1, p2, p3, p4, p5:
+        p1, p2, p3, p4, p5, p6 = self._drift_patches(2)
+        with p1, p2, p3, p4, p5, p6:
             workflow._handle_fixing(gh, _TEST_SPEC, gh.get_issue(30))
         self._assert_routed(gh, 30)
+        self.recover.assert_called_once()
 
-    def test_unpushed_rebase_routes_to_resolving_conflict(self) -> None:
-        # Variant 2 (the #10 case): worktree ON base but local HEAD differs
-        # from the stale remote PR head -> a rebase that was never pushed.
-        # Route to resolving_conflict, which republishes it.
+    def test_stuck_push_failed_unpushed_rebase_routes(self) -> None:
+        # Variant 2: stuck `push_failed` + worktree ON base but local HEAD
+        # differs from the stale remote PR head -> resolving_conflict
+        # recognises the already-rebased worktree and republishes it.
         gh = FakeGitHubClient()
         self._seed_parked_fixing(gh, 34)
-        p1, p2, p3, p4, p5 = self._drift_patches(0, local_head="079210cabc")
-        with p1, p2, p3, p4, p5:
+        p1, p2, p3, p4, p5, p6 = self._drift_patches(0, local_head="079210cabc")
+        with p1, p2, p3, p4, p5, p6:
             workflow._handle_fixing(gh, _TEST_SPEC, gh.get_issue(34))
         self._assert_routed(gh, 34)
 
-    def test_in_sync_with_pr_stays_parked(self) -> None:
-        # On base AND local HEAD == PR head: nothing to reconcile, the park
-        # is a genuine dev question -> keep waiting, no reroute, no write.
+    def test_stuck_push_failed_in_sync_stays_parked(self) -> None:
+        # On base AND local HEAD == PR head: drift is not the underlying
+        # blocker. The recovery already declared "stuck" -> bail silently
+        # so the human can investigate, do not re-post any comment.
         gh = FakeGitHubClient()
         self._seed_parked_fixing(gh, 31)
-        p1, p2, p3, p4, p5 = self._drift_patches(0, local_head=self.PR_HEAD)
-        with p1, p2, p3, p4, p5:
+        p1, p2, p3, p4, p5, p6 = self._drift_patches(0, local_head=self.PR_HEAD)
+        with p1, p2, p3, p4, p5, p6:
             workflow._handle_fixing(gh, _TEST_SPEC, gh.get_issue(31))
 
         self.assertNotIn((31, "resolving_conflict"), gh.label_history)
         self.assertTrue(gh.pinned_data(31).get("awaiting_human"))
         self.post.assert_not_called()
-        self.assertEqual(gh.write_state_calls, 0)
 
-    def test_held_stays_parked(self) -> None:
+    def test_stuck_push_failed_held_stays_parked(self) -> None:
         # `hold_base_sync` is an explicit operator pause; respect it even
         # when the worktree is behind base.
         gh = FakeGitHubClient()
         self._seed_parked_fixing(gh, 32, extra_labels=("hold_base_sync",))
-        p1, p2, p3, p4, p5 = self._drift_patches(5)
-        with p1, p2, p3, p4, p5:
+        p1, p2, p3, p4, p5, p6 = self._drift_patches(5)
+        with p1, p2, p3, p4, p5, p6:
             workflow._handle_fixing(gh, _TEST_SPEC, gh.get_issue(32))
 
         self.assertNotIn((32, "resolving_conflict"), gh.label_history)
         self.assertTrue(gh.pinned_data(32).get("awaiting_human"))
         self.post.assert_not_called()
 
-    def test_dirty_stays_parked(self) -> None:
+    def test_stuck_push_failed_dirty_stays_parked(self) -> None:
         # A dirty worktree is a park an operator may be inspecting;
         # `resolving_conflict` would reset it to the remote, so leave it.
         gh = FakeGitHubClient()
         self._seed_parked_fixing(gh, 33)
-        p1, p2, p3, p4, p5 = self._drift_patches(5, dirty=("src/x.py",))
-        with p1, p2, p3, p4, p5:
+        p1, p2, p3, p4, p5, p6 = self._drift_patches(5, dirty=("src/x.py",))
+        with p1, p2, p3, p4, p5, p6:
             workflow._handle_fixing(gh, _TEST_SPEC, gh.get_issue(33))
 
         self.assertNotIn((33, "resolving_conflict"), gh.label_history)
         self.assertTrue(gh.pinned_data(33).get("awaiting_human"))
         self.post.assert_not_called()
 
+    def test_question_park_with_drift_stays_parked(self) -> None:
+        # A `park_reason=None` `_on_question` shape could be a real agent
+        # question or a "nothing to fix" remark; route neither by inspection.
+        gh = FakeGitHubClient()
+        self._seed_parked_fixing(gh, 35, park_reason=None)
+        p1, p2, p3, p4, p5, p6 = self._drift_patches(7)
+        with p1, p2, p3, p4, p5, p6:
+            workflow._handle_fixing(gh, _TEST_SPEC, gh.get_issue(35))
+
+        self.assertNotIn((35, "resolving_conflict"), gh.label_history)
+        self.assertTrue(gh.pinned_data(35).get("awaiting_human"))
+        self.post.assert_not_called()
+        self.recover.assert_not_called()
+
+    def test_in_review_route_transient_with_drift_stays_parked(self) -> None:
+        # In_review-route transient parks (`pending_fix_at` set) are
+        # deliberately NOT auto-recovered: the round and watermark
+        # semantics differ from the validating route.
+        gh = FakeGitHubClient()
+        self._seed_parked_fixing(
+            gh, 36, pending_fix_at="2026-05-23T00:00:00+00:00",
+        )
+        p1, p2, p3, p4, p5, p6 = self._drift_patches(4)
+        with p1, p2, p3, p4, p5, p6:
+            workflow._handle_fixing(gh, _TEST_SPEC, gh.get_issue(36))
+
+        self.assertNotIn((36, "resolving_conflict"), gh.label_history)
+        self.assertTrue(gh.pinned_data(36).get("awaiting_human"))
+        self.post.assert_not_called()
+        self.recover.assert_not_called()
+
+    def test_stuck_silent_park_with_drift_stays_parked(self) -> None:
+        # `agent_silent` is not in `_VALIDATING_TRANSIENT_PARK_REASONS`
+        # (the silent-crash counter is the recovery channel, not drift)
+        # so even with `pending_fix_at` unset the issue must stay parked.
+        gh = FakeGitHubClient()
+        self._seed_parked_fixing(gh, 37, park_reason="agent_silent")
+        p1, p2, p3, p4, p5, p6 = self._drift_patches(3)
+        with p1, p2, p3, p4, p5, p6:
+            workflow._handle_fixing(gh, _TEST_SPEC, gh.get_issue(37))
+
+        self.assertNotIn((37, "resolving_conflict"), gh.label_history)
+        self.assertTrue(gh.pinned_data(37).get("awaiting_human"))
+        self.post.assert_not_called()
+        self.recover.assert_not_called()
 
 if __name__ == "__main__":
     unittest.main()
