@@ -442,7 +442,7 @@ def _handle_resolving_conflict(
         # base before crashing -- HEAD contains base, the follow-up
         # rebase below would be a no-op, and a direct flip to validating
         # is correct. But the `fixing` drift router
-        # (`_route_parked_fixing_to_resolving_conflict`) also reroutes
+        # (`_reconcile_parked_fixing`) also reroutes
         # here when a `push_failed` park has UNPUSHED FIX COMMITS on a
         # stale base: the commits are NOT a rebase, so the push above
         # leaves the branch still behind base. Marking validating now

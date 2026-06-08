@@ -62,25 +62,27 @@ A validating-route transient park (`push_failed` / `agent_timeout` /
 worktree drift: the per-tick base sync stands down on every
 `awaiting_human` park, so a base advance that landed between the prior
 push and this tick leaves the integration work nobody else will do
-stranded. `_route_parked_fixing_to_resolving_conflict` breaks that
-dead-lock by handing the issue to `resolving_conflict` (which owns
-rebasing AND publishing a PR branch) when the clean worktree is either
-BEHIND `<remote>/<base>` (needs a rebase) or already rebased onto base
-but diverged from a stale remote PR head (a rebase a prior run never
-pushed -- `_handle_resolving_conflict` recognizes the already-rebased
-worktree and force-publishes it). The router is deliberately gated on
-the stuck-transient branch: parks shaped like a real agent question or
-a dirty worktree (`park_reason=None`, `agent_silent`, `dirty_worktree`)
-stay parked even when the worktree has drifted, because we cannot
-distinguish a genuine "agent needs input" from a "nothing to fix"
-remark by inspection -- auto-recovering either would silently bypass
-the HITL contract. The router also no-ops when `hold_base_sync` is set,
-the worktree is missing / dirty, or the worktree is already in sync
-with the PR head.
+stranded. `_reconcile_parked_fixing` breaks that dead-lock by handing
+the issue to `resolving_conflict` (which owns rebasing AND publishing a
+PR branch) when the clean worktree is either BEHIND `<remote>/<base>`
+(needs a rebase) or already rebased onto base but diverged from a stale
+remote PR head (a rebase a prior run never pushed -- `_handle_resolving_conflict`
+recognizes the already-rebased worktree and force-publishes it). The
+drift route is deliberately gated on the validating-route stuck-transient
+branch: parks shaped like a real agent question or a dirty worktree
+(`park_reason=None`, `agent_silent`, `dirty_worktree`) stay parked even
+when the worktree has drifted, because we cannot distinguish a genuine
+"agent needs input" from a "nothing to fix" remark by inspection --
+auto-recovering either would silently bypass the HITL contract. The
+helper no-ops when `hold_base_sync` is set, the worktree is missing /
+dirty, or the worktree is already in sync with the PR head.
 
 Separately, an in_review-route resume that produces no commit but ends
 with an explicit `ACK: <reason>` marker returns straight to `in_review`
-without parking. Unmarked no-commit replies still park for human input.
+without parking. Unmarked no-commit replies park awaiting human: we
+cannot distinguish "agent has a real question" from "agent reported
+nothing to change" by inspection, and auto-recovering either would
+silently bypass the HITL contract.
 
 PR-state terminals (merged / closed-without-merge / open-PR-with-closed-issue)
 mirror the in_review arcs so an external manual merge or rejection while
@@ -315,9 +317,7 @@ def _handle_fixing(gh: GitHubClient, spec: RepoSpec, issue: Issue) -> None:
                 # / dirty / silent / in_review-route transient parks fall
                 # through to the bare `return` below and keep waiting for
                 # a human comment.
-                _route_parked_fixing_to_resolving_conflict(
-                    gh, spec, issue, state, pr,
-                )
+                _reconcile_parked_fixing(gh, spec, issue, state, pr)
                 return
             # Conditions resolved (either no fix landed or a deferred
             # push finished). Clear the park flags and flip back to
@@ -343,7 +343,12 @@ def _handle_fixing(gh: GitHubClient, spec: RepoSpec, issue: Issue) -> None:
             # "agent reported nothing to change" by inspection -- both
             # surface through `_on_question` with `park_reason=None` --
             # so auto-routing either would silently bypass the HITL
-            # contract.
+            # contract. The same applies to a clean in-sync worktree on
+            # the in_review route: the dev may have replied with a real
+            # question that needs a human to resolve, so the only
+            # automatic exit from `fixing` for the in_review route is
+            # the ACK fast path below (on the same tick the dev
+            # explicitly marks its no-commit reply with `ACK:`).
             return
         state.set("awaiting_human", False)
         state.set("park_reason", None)
@@ -523,7 +528,7 @@ def _handle_fixing(gh: GitHubClient, spec: RepoSpec, issue: Issue) -> None:
     gh.write_pinned_state(issue, state)
 
 
-def _route_parked_fixing_to_resolving_conflict(
+def _reconcile_parked_fixing(
     gh: GitHubClient, spec: RepoSpec, issue: Issue, state, pr,
 ) -> bool:
     """Hand a stuck validating-route transient `fixing` park to
@@ -540,15 +545,17 @@ def _route_parked_fixing_to_resolving_conflict(
     `resolving_conflict`, which owns rebasing AND publishing a PR
     branch:
 
-    * **Worktree out of sync with the PR** (behind base, or already rebased
-      locally but never pushed so local HEAD ≠ the live `pr.head.sha`) ->
-      route to `resolving_conflict`, which owns rebasing AND publishing a
-      PR branch:
+      * worktree BEHIND `<remote>/<base>` -> needs a rebase.
+      * worktree already rebased locally but the rewrite was never pushed,
+        so local HEAD differs from the (stale) remote PR head -> needs a
+        force-publish (`_handle_resolving_conflict` recognizes an
+        already-rebased worktree and publishes it instead of parking).
 
-        - behind `<remote>/<base>` (a local `rev-list HEAD..<remote>/<base>`)
-          -> needs a rebase;
-        - already rebased locally but never pushed (local HEAD ≠ the live
-          `pr.head.sha`) -> needs a force-publish.
+    Relabel to `resolving_conflict` so its handler reconciles either shape
+    on the next tick. The routing decision is cheap: base drift is a local
+    `rev-list HEAD..<remote>/<base>`, and the unpushed-rebase check
+    compares local HEAD to `pr.head.sha` (the live remote head the handler
+    already fetched this tick) -- no extra fetch here.
 
     Returns False (issue stays parked) when the worktree is missing,
     dirty (an operator may be inspecting a dirty-tree park), the issue
@@ -556,11 +563,9 @@ def _route_parked_fixing_to_resolving_conflict(
     integration), or the worktree is already in sync with the PR head
     (the transient condition is the real blocker, not drift).
 
-    The routing decision is cheap: no extra fetch, since `pr` was already
-    fetched this tick. For the drift routes, the `pending_fix_*` bookmarks
-    and in_review watermarks are left untouched so the eventual `in_review`
-    re-entry still re-discovers the feedback (mirrors the refresh-time
-    conflict detour).
+    The `pending_fix_*` bookmarks and in_review watermarks are left
+    untouched so the eventual `in_review` re-entry still re-discovers the
+    feedback (mirrors the refresh-time conflict detour).
     """
     from .. import workflow as _wf
 
@@ -589,7 +594,7 @@ def _route_parked_fixing_to_resolving_conflict(
         return False
 
     if behind > 0:
-        reason = f"{behind} commit(s) behind `{base_ref}`"
+        drift_reason = f"{behind} commit(s) behind `{base_ref}`"
     else:
         # On top of base: is the local branch out of sync with the PR
         # head? `pr` was fetched fresh this tick, so `pr.head.sha` is the
@@ -599,7 +604,7 @@ def _route_parked_fixing_to_resolving_conflict(
         local_head = _wf._head_sha(wt) or ""
         pr_head = getattr(getattr(pr, "head", None), "sha", None) or ""
         if local_head and pr_head and local_head != pr_head:
-            reason = (
+            drift_reason = (
                 f"already rebased onto `{base_ref}`, but the PR head "
                 f"(`{pr_head[:8]}`) is stale (local `{local_head[:8]}`)"
             )
@@ -616,7 +621,7 @@ def _route_parked_fixing_to_resolving_conflict(
     try:
         _wf._post_pr_comment(
             gh, pr_number, state,
-            f":mag: PR worktree is out of sync ({reason}) and the `fixing` "
+            f":mag: PR worktree is out of sync ({drift_reason}) and the `fixing` "
             "fix-loop is parked on a stuck transient condition that the "
             "self-recovery could not clear. Routing `fixing` -> "
             "`resolving_conflict` to reconcile the branch before the next "
@@ -641,7 +646,7 @@ def _route_parked_fixing_to_resolving_conflict(
     _wf.log.info(
         "issue=#%s parked `fixing` worktree is out of sync (%s); routing -> "
         "resolving_conflict",
-        issue.number, reason,
+        issue.number, drift_reason,
     )
     gh.set_workflow_label(issue, WorkflowLabel.RESOLVING_CONFLICT)
     gh.write_pinned_state(issue, state)

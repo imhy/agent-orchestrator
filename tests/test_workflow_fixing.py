@@ -228,6 +228,54 @@ class HandleFixingTest(unittest.TestCase, _PatchedWorkflowMixin):
         self.assertNotIn((880, "in_review"), gh.label_history)
         self.assertTrue(gh.pinned_data(880).get("awaiting_human"))
 
+    def test_no_ack_in_review_park_stays_parked_on_next_tick(self) -> None:
+        # Regression: a no-commit no-ACK reply parks via `_on_question`
+        # (park_reason=None) on the first tick AND leaves the worktree
+        # matching the PR head. The next tick must keep the issue parked
+        # awaiting a human reply -- a real dev question is the same shape
+        # as a "nothing to fix" remark by inspection, so auto-routing
+        # back to `in_review` would silently bypass the HITL contract.
+        old = datetime.now(timezone.utc) - timedelta(hours=1)
+        comment = FakeComment(
+            id=2000, body="continue",
+            user=FakeUser("alice"), created_at=old,
+        )
+        pr = self._open_pr()
+        gh, issue = self._seed(
+            pr=pr,
+            issue_comments=[comment],
+            extra_state={
+                # The in_review handler sets this when it routes fresh PR
+                # feedback into `fixing`; it discriminates the in_review
+                # route from the validating `CHANGES_REQUESTED` route.
+                "pending_fix_at": "2026-05-23T00:00:00+00:00",
+                "pending_fix_issue_max_id": 2000,
+                # Already parked from a prior tick whose dev resume produced
+                # no commit and no ACK marker (the `_on_question` shape).
+                "awaiting_human": True,
+                "park_reason": None,
+                # Watermark already past the triggering comment so the
+                # rescan finds no new feedback.
+                "pr_last_comment_id": 2000,
+            },
+        )
+
+        with patch.object(config, "IN_REVIEW_DEBOUNCE_SECONDS", 600):
+            mocks = self._run(
+                lambda: workflow._handle_fixing(gh, _TEST_SPEC, issue),
+                run_agent=_agent(),
+            )
+
+        self.assertNotIn((880, "in_review"), gh.label_history)
+        data = gh.pinned_data(880)
+        self.assertTrue(data.get("awaiting_human"))
+        # Bookmarks left intact for the eventual human-reply re-entry.
+        self.assertEqual(data.get("pending_fix_at"), "2026-05-23T00:00:00+00:00")
+        # The handler short-circuits at the awaiting-human + no-new-feedback
+        # gate -- no dev resume, no push.
+        mocks["run_agent"].assert_not_called()
+        mocks["_push_branch"].assert_not_called()
+
     # --- newer comments extend the debounce window ------------------------
 
     def test_newer_comment_extends_debounce_window(self) -> None:
