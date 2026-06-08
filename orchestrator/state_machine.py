@@ -143,11 +143,13 @@ _FORWARD: dict[Optional[WorkflowLabel], frozenset[WorkflowLabel]] = {
     WorkflowLabel.FIXING: frozenset(
         {
             WorkflowLabel.VALIDATING,
-            # The worktree-drift dead-lock breaker hands a parked fixing
-            # issue to `resolving_conflict` (out of sync with the PR) or
-            # back to `in_review` (in sync, nothing to fix on the in_review
-            # route -- the ACK / in-sync return).
+            # The worktree-drift dead-lock breaker hands a stuck
+            # validating-route transient park to `resolving_conflict`
+            # when the worktree is out of sync with the PR head.
             WorkflowLabel.RESOLVING_CONFLICT,
+            # The ACK fast path returns an in_review-route resume that
+            # explicitly marked its no-commit reply with `ACK: <reason>`
+            # straight to `in_review` without parking.
             WorkflowLabel.IN_REVIEW,
         }
     ),

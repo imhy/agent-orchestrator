@@ -1728,7 +1728,7 @@ class HandleResolvingConflictTest(
 
     def test_recovered_push_with_stale_base_falls_through_to_rebase(self) -> None:
         # The `fixing` drift router
-        # (`_route_parked_fixing_to_resolving_conflict`) reroutes here
+        # (`_reconcile_parked_fixing`) reroutes here
         # when a stuck `push_failed` / `agent_timeout` park has
         # UNPUSHED FIX COMMITS on a base that has since advanced. The
         # recovered-push fast path would publish the fix to the PR

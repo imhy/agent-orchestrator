@@ -417,10 +417,10 @@ class FixingWorktreeDriftRoutingTest(unittest.TestCase):
     When a validating-route transient park (e.g. `push_failed`) cannot
     clear via the self-recovery (`_try_recover_validating_transient_park`
     returns "stuck"), `_handle_fixing` falls through to
-    `_route_parked_fixing_to_resolving_conflict` so a base advance that
-    landed mid-park can still unstick the issue. The router must hand
-    both drift shapes to `resolving_conflict` while leaving any park that
-    could be hiding a real dev question parked for the human.
+    `_reconcile_parked_fixing` so a base advance that
+    landed mid-park can still unstick the issue. The helper must hand
+    both drift shapes to `resolving_conflict` while leaving any park
+    that could be hiding a real dev question parked for the human.
     """
 
     PR_HEAD = "prhead00cafe1234"
