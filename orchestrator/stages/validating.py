@@ -3,7 +3,9 @@
 """Validating stage handlers and reviewer-session lifecycle.
 
 Owns `_handle_validating` plus the reviewer-side primitives the rest of
-the workflow re-uses: post-agent dev-fix disposition (`_handle_dev_fix_result`),
+the workflow re-uses: post-agent dev-fix disposition (`_handle_dev_fix_result`,
+with its stage-private stranded-fix deferred-publish gate
+`_stranded_fix_unpushed`),
 post-resume disposition for a user-content-change dev resume
 (`_post_user_content_change_result`), the validating-side transient-park
 recovery (`_try_recover_validating_transient_park` plus its
@@ -94,6 +96,39 @@ _VALIDATING_TRANSIENT_PARK_REASONS = frozenset(
 )
 
 
+def _stranded_fix_unpushed(
+    spec: RepoSpec, wt: Path, state: PinnedState, issue: Issue
+) -> bool:
+    """True when a clean worktree HEAD is strictly ahead of the remote PR
+    branch -- a fix an earlier parked run committed but never published.
+
+    The shape arises when the publish was blocked at commit time (e.g. a
+    dirty-worktree park whose stray files a human later had the dev clean
+    up): every later resume sees `after_sha == before_sha`, so without
+    this check the stranded commit can never reach the PR and the issue
+    ping-pongs between `awaiting_human` parks forever.
+
+    Conservative by construction: a dirty tree, a failed fetch, or a
+    remote that moved (`behind > 0` -- pushing would race a head we have
+    not reconciled) all report False so the caller falls back to the
+    question park instead of pushing blind.
+    """
+    from .. import workflow as _wf
+
+    if _wf._worktree_dirty_files(wt):
+        return False
+    branch = _wf._resolve_branch_name(state, spec, issue.number)
+    fetch = _wf._authed_fetch(
+        spec,
+        f"+refs/heads/{branch}:refs/remotes/{spec.remote_name}/{branch}",
+        cwd=wt,
+    )
+    if fetch.returncode != 0:
+        return False
+    ahead, behind = _wf._branch_ahead_behind(spec, wt, branch)
+    return ahead > 0 and behind == 0
+
+
 def _handle_dev_fix_result(
     gh: GitHubClient,
     spec: RepoSpec,
@@ -109,7 +144,9 @@ def _handle_dev_fix_result(
     Returns True if a fix was committed, pushed, and the caller should
     advance the label (validating routes the issue back to `validating`
     on True so the reviewer re-runs against the new head; any stale
-    approval state must be reset by the caller before relabeling).
+    approval state must be reset by the caller before relabeling). A
+    no-new-commit run also returns True when it published a stranded fix
+    a prior parked run had committed (see `_stranded_fix_unpushed`).
     Returns False if the run produced no fix (timeout, no-new-commit,
     dirty tree, or push failure); caller should write state and return.
 
@@ -144,9 +181,13 @@ def _handle_dev_fix_result(
     if after_sha is None:
         after_sha = _wf._head_sha(wt)
     if after_sha == before_sha or not after_sha:
-        # No new commit: dev asked a question or did nothing.
-        _wf._on_question(gh, issue, state, result)
-        return False
+        if not after_sha or not _stranded_fix_unpushed(spec, wt, state, issue):
+            # No new commit: dev asked a question or did nothing.
+            _wf._on_question(gh, issue, state, result)
+            return False
+        # HEAD carries a committed-but-unpublished fix from a prior
+        # parked run; fall through to the shared push tail exactly as
+        # if this run had committed it.
 
     # A new commit landed -- the session is alive and producing output, so
     # the silent-park streak must reset here. Otherwise a single later

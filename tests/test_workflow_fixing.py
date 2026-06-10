@@ -25,7 +25,7 @@ import os
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 os.environ.setdefault("ORCHESTRATOR_SKIP_DOTENV", "1")
 
@@ -1448,6 +1448,142 @@ class HandleFixingTest(unittest.TestCase, _PatchedWorkflowMixin):
         # Agent's question was surfaced to the human.
         joined = "\n".join(b for _, b in gh.posted_comments)
         self.assertIn("Should I prefer ruff or black for this?", joined)
+
+    # --- stranded-fix deferred publish -----------------------------------
+
+    def _seed_stranded(self, *, reply_id: int = 2600):
+        # Validating-route park (`pending_fix_at` unset) with a human
+        # reply past the debounce window -- the live shape of a fix that
+        # was committed during an earlier dirty-park, cleaned up by hand,
+        # and now sits on HEAD with nothing left for the dev to commit.
+        long_ago = datetime.now(timezone.utc) - timedelta(hours=1)
+        reply = FakeComment(
+            id=reply_id, body="continue",
+            user=FakeUser("alice"), created_at=long_ago,
+        )
+        pr = self._open_pr()
+        gh, issue = self._seed(
+            pr=pr, issue_comments=[reply],
+            extra_state={
+                "awaiting_human": True,
+                "park_reason": None,
+                "pr_last_comment_id": 2500,
+                "pending_fix_at": None,
+                "pending_fix_issue_max_id": None,
+                "review_round": 2,
+            },
+        )
+        return gh, issue
+
+    def test_no_commit_with_stranded_fix_publishes_it(self) -> None:
+        # The resume produced no new commit, but the clean worktree HEAD
+        # is ahead of the remote PR branch: a prior parked run committed
+        # a fix that was never pushed. The handler must publish it and
+        # flip back to `validating` (bumping the round -- validating
+        # route) instead of parking on a question the dev cannot answer.
+        gh, issue = self._seed_stranded()
+
+        with patch.object(config, "IN_REVIEW_DEBOUNCE_SECONDS", 600):
+            mocks = self._run(
+                lambda: workflow._handle_fixing(gh, _TEST_SPEC, issue),
+                run_agent=_agent(
+                    session_id="dev-sess",
+                    last_message="nothing new to commit; the fix is already on HEAD",
+                ),
+                head_shas=("sha-before", "sha-before"),
+                branch_ahead_behind=(1, 0),
+            )
+
+        mocks["_push_branch"].assert_called_once()
+        data = gh.pinned_data(880)
+        self.assertFalse(data.get("awaiting_human"))
+        self.assertEqual(data.get("review_round"), 3)
+        self.assertIn((880, "validating"), gh.label_history)
+
+    def test_no_commit_stranded_fix_behind_remote_parks(self) -> None:
+        # Remote PR branch moved past our local view (behind > 0):
+        # pushing would race a head we have not reconciled, so the
+        # handler must fall back to the question park.
+        gh, issue = self._seed_stranded()
+
+        with patch.object(config, "IN_REVIEW_DEBOUNCE_SECONDS", 600):
+            mocks = self._run(
+                lambda: workflow._handle_fixing(gh, _TEST_SPEC, issue),
+                run_agent=_agent(
+                    session_id="dev-sess", last_message="nothing to do",
+                ),
+                head_shas=("sha-before", "sha-before"),
+                branch_ahead_behind=(1, 2),
+            )
+
+        mocks["_push_branch"].assert_not_called()
+        data = gh.pinned_data(880)
+        self.assertTrue(data.get("awaiting_human"))
+        self.assertNotIn((880, "validating"), gh.label_history)
+
+    def test_no_commit_stranded_fix_fetch_failure_parks(self) -> None:
+        # The pre-push fetch failed; without a current view of the
+        # remote PR head the ahead/behind comparison is meaningless, so
+        # the handler must not push and falls back to the question park.
+        gh, issue = self._seed_stranded()
+
+        with patch.object(config, "IN_REVIEW_DEBOUNCE_SECONDS", 600):
+            mocks = self._run(
+                lambda: workflow._handle_fixing(gh, _TEST_SPEC, issue),
+                run_agent=_agent(
+                    session_id="dev-sess", last_message="nothing to do",
+                ),
+                head_shas=("sha-before", "sha-before"),
+                branch_ahead_behind=(1, 0),
+                authed_fetch_result=MagicMock(returncode=1, stderr="boom"),
+            )
+
+        mocks["_push_branch"].assert_not_called()
+        self.assertTrue(gh.pinned_data(880).get("awaiting_human"))
+
+    def test_no_commit_stranded_fix_dirty_tree_parks(self) -> None:
+        # Stray uncommitted files alongside the stranded commit: pushing
+        # only the commit would publish an incomplete branch (the exact
+        # shape the dirty-park guard exists for), so the handler must
+        # keep the question park.
+        gh, issue = self._seed_stranded()
+
+        with patch.object(config, "IN_REVIEW_DEBOUNCE_SECONDS", 600):
+            mocks = self._run(
+                lambda: workflow._handle_fixing(gh, _TEST_SPEC, issue),
+                run_agent=_agent(
+                    session_id="dev-sess", last_message="nothing to do",
+                ),
+                head_shas=("sha-before", "sha-before"),
+                branch_ahead_behind=(1, 0),
+                dirty_files=("AGENTS.md",),
+            )
+
+        mocks["_push_branch"].assert_not_called()
+        self.assertTrue(gh.pinned_data(880).get("awaiting_human"))
+
+    def test_no_commit_stranded_fix_push_failure_parks_transient(self) -> None:
+        # The deferred publish reuses the shared push tail, so a failed
+        # push lands the standard `push_failed` transient park (which the
+        # next tick's silent recovery can retry).
+        gh, issue = self._seed_stranded()
+
+        with patch.object(config, "IN_REVIEW_DEBOUNCE_SECONDS", 600):
+            mocks = self._run(
+                lambda: workflow._handle_fixing(gh, _TEST_SPEC, issue),
+                run_agent=_agent(
+                    session_id="dev-sess", last_message="nothing to do",
+                ),
+                head_shas=("sha-before", "sha-before"),
+                branch_ahead_behind=(1, 0),
+                push_branch=False,
+            )
+
+        mocks["_push_branch"].assert_called_once()
+        data = gh.pinned_data(880)
+        self.assertTrue(data.get("awaiting_human"))
+        self.assertEqual(data.get("park_reason"), "push_failed")
+        self.assertNotIn((880, "validating"), gh.label_history)
 
     def test_agent_silent_failure_parks_in_fixing(self) -> None:
         # Dev returned empty `last_message` and no commit. The handler
