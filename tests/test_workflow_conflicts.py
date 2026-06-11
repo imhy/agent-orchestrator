@@ -1373,6 +1373,11 @@ class HandleResolvingConflictTest(
         mocks["run_agent"].assert_called_once()
         prompt = mocks["run_agent"].call_args.args[1]
         self.assertIn("try harder", prompt)
+        # The bare human-reply followup must carry the foreground-only
+        # execution-model note -- a resumed dev that backgrounds a slow
+        # test run and ends its turn "to check later" strands the issue
+        # (the job dies with the session).
+        self.assertIn("NEVER start a background job", prompt)
         merge_mock.assert_not_called()
         # Successful resume pushes the branch and hands straight back
         # to `validating`. Docs do not run here -- the single docs pass
