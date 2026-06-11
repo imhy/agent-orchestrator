@@ -271,6 +271,7 @@ def _handle_resolving_conflict(
             f"@{c.user.login if c.user else 'user'}: {c.body}"
             for c in new_comments if c.body
         )
+        followup = f"{followup}\n\n{_wf._FOREGROUND_ONLY_NOTE}"
         wt = _wf._worktree_path(spec, issue.number)
         if not wt.exists():
             wt = _wf._ensure_pr_worktree(
